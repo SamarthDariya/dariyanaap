@@ -17,10 +17,17 @@ public:
     explicit Error(const std::string& what);
 };
 
-// A rate, duration, or connection count that cannot describe a real run.
-class InvalidArgument : public Error {
+// A human typed something that cannot describe a real run: a negative rate, a
+// port of zero, a duration of "soon".
+//
+// Named for the human, not for the callee. std::invalid_argument — the obvious
+// name — derives from std::logic_error, which the standard reserves for a
+// caller violating a precondition, i.e. a bug. This is the opposite: the
+// program is fine and the input was wrong, so it derives from runtime_error
+// and the CLI turns it into a usage message rather than a crash.
+class UsageError : public Error {
 public:
-    explicit InvalidArgument(const std::string& what);
+    explicit UsageError(const std::string& what);
 };
 
 }  // namespace dariyanaap

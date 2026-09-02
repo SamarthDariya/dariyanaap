@@ -8,6 +8,6 @@ namespace dariyanaap {
 // rather than a copy in every includer.
 Error::Error(const string& what) : runtime_error(what) {}
 
-InvalidArgument::InvalidArgument(const string& what) : Error(what) {}
+UsageError::UsageError(const string& what) : Error(what) {}
 
 }  // namespace dariyanaap
