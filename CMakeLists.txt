@@ -65,6 +65,7 @@ set(DARIYANAAP_WARNINGS -Wall -Wextra -Wpedantic)
 add_library(dariyanaap_core
   src/core/version.cpp
   src/core/errors.cpp
+  src/core/units.cpp
 )
 target_include_directories(dariyanaap_core PUBLIC src)
 target_compile_options(dariyanaap_core PRIVATE ${DARIYANAAP_WARNINGS})
