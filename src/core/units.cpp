@@ -27,7 +27,13 @@ Rate Rate::per_second(double rps) {
         throw UsageError("rate must be a finite number of requests per second");
     }
     if (rps < kMinRps || rps > kMaxRps) {
-        throw UsageError("rate must be between 0.001 and 1e9 rps, got " + to_string(rps));
+        // ostringstream, as in str(): to_string(1e18) prints nineteen digits
+        // and to_string(0.0) prints "0.000000", neither of which reads as the
+        // number the operator typed.
+        ostringstream out;
+        out << "rate must be between " << kMinRps << " and " << kMaxRps
+            << " rps, got " << rps;
+        throw UsageError(out.str());
     }
     return Rate(rps);
 }
