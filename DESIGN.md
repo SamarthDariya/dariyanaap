@@ -153,6 +153,14 @@ But unit 2 is specifically about a **backend restarting with a cold cache** and 
 warm-up is a flag with a default, printed in the CSV header, never a hidden constant. Any number this
 rig prints must be attributable to a configuration a reader can see.
 
+The rig's *self*-measurement sits inside the same window, which was not obvious until it was
+measured. `MonotonicClock::measured_resolution()` reports **90ns** as the first thing a process does
+and **35–42ns** once the core has clocked up — and 42ns is one tick of the 24MHz timebase, so the warm
+number is the hardware floor and the cold one is an artifact of when it was taken. Measuring at
+startup would publish a p99 floor more than twice too high, and decision 7 would then be quoting a
+wrong number into every later repo. So resolution is measured at the *end* of warm-up, not at
+process start.
+
 ### 9. Fault checks must be cheap enough to ship in the hot path
 
 A target links `fault` and calls into it on its request path unconditionally. So a disabled check is

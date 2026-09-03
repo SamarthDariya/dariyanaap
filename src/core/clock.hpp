@@ -31,11 +31,20 @@ public:
     static Nanos since(Instant start) { return now() - start; }
     static Nanos between(Instant start, Instant end) { return end - start; }
 
-    // The smallest interval this machine can actually distinguish, measured at
-    // startup rather than assumed. Printed in the CSV header: a p99 floor of
-    // 800ns means something different on a clock that ticks in 1us steps than
-    // on one that ticks in 40ns steps, and decision 7 says the rig publishes
-    // its own limits instead of letting them be inferred.
+    // The smallest interval this machine can actually distinguish, measured
+    // rather than assumed. Printed in the CSV header: a p99 floor of 800ns
+    // means something different on a clock that ticks in 1us steps than on one
+    // that ticks in 40ns steps, and decision 7 says the rig publishes its own
+    // limits instead of letting them be inferred.
+    //
+    // Call it at the END of the warm-up window, not at process start. Measured
+    // on this machine: 90ns as the first thing the process does, 35-42ns once
+    // the core has clocked up — a 2.5x spread that is CPU frequency scaling,
+    // not clock granularity. 42ns is one tick of the 24MHz timebase, so the
+    // warm number is the real floor and the cold one is an artifact of when it
+    // was taken. Reporting the cold number would overstate the rig's floor by
+    // more than a factor of two, which is decision 8's warm-up argument
+    // applying to the rig's own self-measurement.
     static Nanos measured_resolution();
 };
 
