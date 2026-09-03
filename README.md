@@ -148,7 +148,17 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-With sanitizers:
+Or in one command, which is what the inner loop actually uses:
+
+```sh
+./scripts/check.sh          # build + test
+./scripts/check.sh --all    # also ASan/UBSan and TSan — the gate for "done"
+```
+
+It also enforces DESIGN.md decision 12 (`steady_clock` only) with a grep, so a
+`system_clock` creeping into `src/` fails the check rather than a review.
+
+With sanitizers by hand:
 
 ```sh
 cmake -B build-tsan -DDARIYANAAP_TSAN=ON && cmake --build build-tsan -j
