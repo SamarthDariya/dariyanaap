@@ -9,6 +9,7 @@
 
 #include "stats/buckets.hpp"
 #include "stats/histogram.hpp"
+#include "stats/summary.hpp"
 
 using namespace dariyanaap;
 
@@ -389,4 +390,109 @@ TEST_CASE("per-thread histograms merged after joining equal one single-threaded 
     for (const double p : {50.0, 90.0, 99.0, 99.9, 100.0}) {
         REQUIRE(merged.percentile(p).value() == single.percentile(p).value());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 1.6 — Summary
+// ---------------------------------------------------------------------------
+
+// Decision 6: no single error rate on the summary. Same enforcement style as
+// the mean — a comment would not have stopped anyone.
+template <class T>
+concept HasErrorRate = requires(const T& t) { t.error_rate(); };
+static_assert(!HasErrorRate<Summary>, "DESIGN.md decision 6: errors are counted by kind, in load");
+
+template <class T>
+concept SummaryHasMean = requires(const T& t) { t.mean(); };
+static_assert(!SummaryHasMean<Summary>, "DESIGN.md decision 3: never report a mean");
+
+TEST_CASE("a run with nothing recorded has no latency summary") {
+    const Histogram empty;
+    CHECK_FALSE(Summary::of(empty, Secs(10)).has_value());
+    // The run still gets reported — by load, with its error counts. What does
+    // not exist is a distribution, and zeros would be a flattering invention.
+}
+
+TEST_CASE("a summary carries the distribution and the duration it came from") {
+    Histogram h;
+    for (std::int64_t v = 1; v <= 1'000; ++v) {
+        h.record(Micros(v));
+    }
+    const Summary s = Summary::of(h, Secs(2)).value();
+
+    CHECK(s.samples == 1'000);
+    CHECK(s.overflow == 0);
+    CHECK(s.duration == Secs(2));
+    CHECK(s.percentiles_bounded());
+
+    CHECK(s.p50 <= s.p90);
+    CHECK(s.p90 <= s.p99);
+    CHECK(s.p99 <= s.p999);
+
+    // max is the histogram's exact value, not a slot edge.
+    CHECK(s.max == Micros(1'000));
+
+    // And so max is NOT the top of the ladder: p999 is a slot's high edge,
+    // rounded up so it never under-reports, and here it exceeds the true
+    // largest sample. Asserting p999 <= max would have been asserting that
+    // the never-under-report guarantee does not hold.
+    CHECK(s.p999 > s.max);
+    CHECK(static_cast<double>((s.p999 - s.max).count()) /
+              static_cast<double>(s.max.count()) < 0.008);
+    // The real upper bound of the ladder is p100, which is >= max by design.
+    CHECK(h.percentile(100.0).value() >= s.max);
+}
+
+TEST_CASE("throughput is samples over wall clock, not over successes") {
+    Histogram h;
+    for (int i = 0; i < 5'000; ++i) {
+        h.record(Micros(10));
+    }
+    const Summary s = Summary::of(h, Secs(2)).value();
+    CHECK(s.per_second() == doctest::Approx(2'500.0));
+
+    const Summary half = Summary::of(h, Millis(500)).value();
+    CHECK(half.per_second() == doctest::Approx(10'000.0));
+}
+
+TEST_CASE("overflow makes the summary say its percentiles are unbounded") {
+    Histogram h;
+    for (int i = 0; i < 999; ++i) {
+        h.record(Micros(100));
+    }
+    h.record(Secs(90));
+
+    const Summary s = Summary::of(h, Secs(1)).value();
+    CHECK(s.overflow == 1);
+    CHECK_FALSE(s.percentiles_bounded());  // the obligation percentile() created
+    CHECK(s.max == Secs(90));
+    // p99.9 is the 1000th of 1000 samples, so it lands past every slot.
+    CHECK(s.p999 == Secs(90));
+    // ...while p99 is still bucketed and unaffected.
+    CHECK(s.p99 == Nanos(buckets::slot_high(buckets::index_of(100'000))));
+}
+
+TEST_CASE("a summary of a merged histogram equals a summary of the whole") {
+    // Summary must not care how the histogram was assembled, or a threaded run
+    // and a single-threaded one would report differently.
+    Histogram a;
+    Histogram b;
+    Histogram whole;
+    for (std::int64_t v = 1; v <= 500; ++v) {
+        a.record(Micros(v));
+        whole.record(Micros(v));
+    }
+    for (std::int64_t v = 501; v <= 1'000; ++v) {
+        b.record(Micros(v));
+        whole.record(Micros(v));
+    }
+    a.merge(b);
+
+    const Summary merged = Summary::of(a, Secs(1)).value();
+    const Summary single = Summary::of(whole, Secs(1)).value();
+    CHECK(merged.samples == single.samples);
+    CHECK(merged.p50 == single.p50);
+    CHECK(merged.p99 == single.p99);
+    CHECK(merged.p999 == single.p999);
+    CHECK(merged.max == single.max);
 }
