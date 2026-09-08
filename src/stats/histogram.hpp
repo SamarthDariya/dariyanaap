@@ -82,6 +82,22 @@ public:
     // A percentile arriving from a CLI flag is checked when the flag is parsed.
     std::optional<Nanos> percentile(double p) const;
 
+    // Fold another thread's histogram into this one. Called once, after the
+    // run, on one thread (DESIGN.md decision 5).
+    //
+    // Deliberately NOT thread-safe, and deliberately not atomic. Making it
+    // safe to call concurrently would make it look usable on the hot path,
+    // and a shared histogram is the exact mistake decision 5 exists to
+    // prevent: at high rates the counter for the modal slot becomes a
+    // contended cache line, and the rig starts costing more than the syscall
+    // it is timing.
+    //
+    // No version or layout check is needed, because the layout is made of
+    // compile-time constants — two Histograms in one binary cannot disagree
+    // about what slot 1,500 means. That is a quiet benefit of buckets.hpp
+    // being constexpr rather than runtime-configured.
+    void merge(const Histogram& other);
+
     // Deliberately absent: mean(). See DESIGN.md decision 3. The mean averages
     // a bimodal distribution whose two modes are "the fast path" and "the
     // problem", and reports neither. stats_tests.cpp asserts it stays absent.

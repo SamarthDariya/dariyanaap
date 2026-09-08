@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <thread>
 #include <vector>
 
 #include "stats/buckets.hpp"
@@ -280,4 +281,112 @@ TEST_CASE("p100 is at least max, and max is the exact one to quote") {
     // correct answers to different questions, and neither is below the truth.
     CHECK(h.percentile(100.0).value() >= h.max());
     CHECK(h.max() == Nanos(1'500'000));
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 1.5 — merge()
+// ---------------------------------------------------------------------------
+
+TEST_CASE("merging preserves every field, including the ones easy to forget") {
+    Histogram a;
+    a.record(Micros(100));
+    a.record(Secs(90));  // overflow, and the larger max
+
+    Histogram b;
+    b.record(Micros(200));
+    b.record(Micros(200));
+
+    a.merge(b);
+    CHECK(a.count() == 4);
+    CHECK(a.overflow() == 1);
+    CHECK(a.max() == Secs(90));
+    CHECK(a.slot(buckets::index_of(100'000)) == 1);
+    CHECK(a.slot(buckets::index_of(200'000)) == 2);
+}
+
+TEST_CASE("merging an empty histogram changes nothing") {
+    Histogram a;
+    a.record(Micros(7));
+    const Histogram empty;
+
+    a.merge(empty);
+    CHECK(a.count() == 1);
+    CHECK(a.max() == Micros(7));
+    CHECK(a.percentile(99.0).value() == Nanos(buckets::slot_high(buckets::index_of(7'000))));
+}
+
+TEST_CASE("merge order does not change the result") {
+    // Threads finish in whatever order they finish, so a merge that depended
+    // on order would make a run non-reproducible.
+    const std::vector<std::int64_t> xs{5, 5, 900, 1'000'000};
+    const std::vector<std::int64_t> ys{7, 800, 2'000'000};
+    const std::vector<std::int64_t> zs{60'000'000'001};  // overflow
+
+    auto build = [](const std::vector<std::int64_t>& vs) {
+        Histogram h;
+        for (const std::int64_t v : vs) h.record(Nanos(v));
+        return h;
+    };
+
+    Histogram forward = build(xs);
+    forward.merge(build(ys));
+    forward.merge(build(zs));
+
+    Histogram backward = build(zs);
+    backward.merge(build(ys));
+    backward.merge(build(xs));
+
+    CHECK(forward.count() == backward.count());
+    CHECK(forward.overflow() == backward.overflow());
+    CHECK(forward.max() == backward.max());
+    for (int i = 0; i < buckets::kCount; ++i) {
+        REQUIRE(forward.slot(i) == backward.slot(i));
+    }
+    CHECK(forward.percentile(99.0).value() == backward.percentile(99.0).value());
+}
+
+TEST_CASE("per-thread histograms merged after joining equal one single-threaded run") {
+    // This is the claim DESIGN.md decision 5 rests on, and the reason TSan is
+    // wired into this repo at all: N threads record into their OWN histogram
+    // with no synchronisation, and the merged result must be bit-identical to
+    // recording every sample on one thread.
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 50'000;
+
+    // A deterministic sample per (thread, i), so both sides see the same set.
+    auto sample = [](int t, int i) -> std::int64_t {
+        return 1 + static_cast<std::int64_t>(t + 1) * 37 + static_cast<std::int64_t>(i) * 811;
+    };
+
+    std::vector<Histogram> per_thread(kThreads);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&per_thread, &sample, t] {
+            for (int i = 0; i < kPerThread; ++i) {
+                per_thread[static_cast<std::size_t>(t)].record(Nanos(sample(t, i)));
+            }
+        });
+    }
+    for (std::thread& th : threads) th.join();
+
+    Histogram merged;
+    for (Histogram& h : per_thread) merged.merge(h);
+
+    Histogram single;
+    for (int t = 0; t < kThreads; ++t) {
+        for (int i = 0; i < kPerThread; ++i) {
+            single.record(Nanos(sample(t, i)));
+        }
+    }
+
+    CHECK(merged.count() == static_cast<std::uint64_t>(kThreads) * kPerThread);
+    CHECK(merged.count() == single.count());
+    CHECK(merged.max() == single.max());
+    CHECK(merged.overflow() == single.overflow());
+    for (int i = 0; i < buckets::kCount; ++i) {
+        REQUIRE(merged.slot(i) == single.slot(i));
+    }
+    for (const double p : {50.0, 90.0, 99.0, 99.9, 100.0}) {
+        REQUIRE(merged.percentile(p).value() == single.percentile(p).value());
+    }
 }

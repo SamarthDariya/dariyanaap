@@ -40,4 +40,18 @@ optional<Nanos> Histogram::percentile(double p) const {
     return Nanos(max_);
 }
 
+void Histogram::merge(const Histogram& other) {
+    // Merging a histogram into itself would double every count. It is almost
+    // certainly a loop indexing mistake rather than an intent, and this is a
+    // cold path, so the check is free.
+    assert(this != &other && "merging a histogram into itself doubles it");
+
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        slots_[i] += other.slots_[i];
+    }
+    count_ += other.count_;
+    overflow_ += other.overflow_;
+    max_ = std::max(max_, other.max_);
+}
+
 }  // namespace dariyanaap
