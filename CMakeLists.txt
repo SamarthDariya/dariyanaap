@@ -109,6 +109,20 @@ add_library(dariyanaap::stats ALIAS dariyanaap_stats)
 # if core ever includes from load, it will not link.
 
 # ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+#
+# hist_verify is M1's benchmark: track rule 3 says a unit without a number is
+# unfinished. Guarded by BUILD_CLI so vendoring dariyanaap into another repo
+# does not build it.
+
+if(DARIYANAAP_BUILD_CLI)
+  add_executable(hist_verify apps/hist_verify.cpp)
+  target_link_libraries(hist_verify PRIVATE dariyanaap_stats)
+  target_compile_options(hist_verify PRIVATE ${DARIYANAAP_WARNINGS})
+endif()
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 

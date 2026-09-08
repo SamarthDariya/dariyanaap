@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -653,4 +654,64 @@ TEST_CASE("an empty histogram writes a header and nothing else") {
     std::ostringstream out;
     csv::write_histogram(out, empty);
     CHECK(lines_of(out.str()).size() == 1);
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 1.8 — the verifier, as a regression test.
+//
+// apps/hist_verify.cpp is the benchmark that produces BREAK.md E1's numbers.
+// This is the same experiment at a smaller N, wired into ctest, so the bound
+// is guarded on every build rather than only when someone remembers to run the
+// tool. The distribution is deliberately not uniform: 1.4's tests use evenly
+// spread values, and a tail bug can hide in those.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("a lognormal body with a rare spike stays inside the bound") {
+    constexpr std::size_t kSamples = 100'000;
+
+    std::mt19937_64 rng(20260902);  // fixed: a regression must be a regression
+    std::lognormal_distribution<double> body(std::log(200'000.0), 0.6);
+    std::uniform_int_distribution<int> spike(1, 1000);
+
+    std::vector<std::int64_t> exact;
+    exact.reserve(kSamples);
+    Histogram h;
+    for (std::size_t i = 0; i < kSamples; ++i) {
+        const std::int64_t ns = spike(rng) == 1
+                                    ? 500'000'000
+                                    : static_cast<std::int64_t>(body(rng));
+        const std::int64_t clamped = std::max<std::int64_t>(ns, 1);
+        exact.push_back(clamped);
+        h.record(Nanos(clamped));
+    }
+    std::sort(exact.begin(), exact.end());
+
+    CHECK(h.count() == kSamples);
+    CHECK(h.overflow() == 0);  // 500ms is well inside the 60s range
+
+    const double bound = 1.0 / static_cast<double>(buckets::kSubBuckets);
+    for (const double p : {50.0, 90.0, 99.0, 99.9, 100.0}) {
+        const std::size_t rank = static_cast<std::size_t>(
+            std::clamp<double>(std::ceil(p / 100.0 * static_cast<double>(kSamples)),
+                               1.0, static_cast<double>(kSamples)));
+        const std::int64_t truth = exact[rank - 1];
+        const std::int64_t got = h.percentile(p).value().count();
+
+        REQUIRE(got >= truth);  // never under-reports, in the tail too
+        REQUIRE(static_cast<double>(got - truth) / static_cast<double>(truth) <= bound);
+    }
+}
+
+TEST_CASE("memory does not grow with sample count") {
+    // The claim that makes the whole layout worth it: 10x the samples, same
+    // bytes. Keeping every sample instead would be 8 bytes each.
+    Histogram small;
+    Histogram large;
+    for (int i = 0; i < 1'000; ++i) small.record(Micros(100 + i % 50));
+    for (int i = 0; i < 100'000; ++i) large.record(Micros(100 + i % 50));
+
+    CHECK(small.count() == 1'000);
+    CHECK(large.count() == 100'000);
+    CHECK(sizeof(small) == sizeof(large));
+    static_assert(sizeof(Histogram) == buckets::kCount * sizeof(std::uint64_t) + 24);
 }
