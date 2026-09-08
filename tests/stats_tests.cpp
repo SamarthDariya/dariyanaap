@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "stats/buckets.hpp"
+#include "stats/histogram.hpp"
 
 using namespace dariyanaap;
 
@@ -103,4 +104,74 @@ TEST_CASE("the 0.781% bound is attained and never exceeded") {
     CHECK(worst > 0.99 / static_cast<double>(buckets::kSubBuckets));
     CHECK(worst_at > 0);
     MESSAGE("worst over-report " << worst * 100.0 << "% at " << worst_at << " ns");
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 1.3 — Histogram
+// ---------------------------------------------------------------------------
+
+// Decision 3 says the histogram must never report a mean. Asserted at compile
+// time rather than trusted to a comment: if anyone adds mean(), this fails.
+template <class T>
+concept HasMean = requires(const T& t) { t.mean(); };
+static_assert(!HasMean<Histogram>, "DESIGN.md decision 3: never report a mean");
+
+TEST_CASE("an empty histogram reports nothing rather than zero-ish nonsense") {
+    const Histogram h;
+    CHECK(h.count() == 0);
+    CHECK(h.overflow() == 0);
+    CHECK(h.max() == Nanos(0));
+    for (int i = 0; i < buckets::kCount; ++i) {
+        REQUIRE(h.slot(i) == 0);
+    }
+}
+
+TEST_CASE("the histogram is fixed-size and small enough to keep one per thread") {
+    // 30KB per thread at 500 connections is 15MB — the reason this is an array
+    // and not a map, and the reason decision 5's per-thread copies are viable.
+    static_assert(sizeof(Histogram) < 32 * 1024);
+    CHECK(sizeof(Histogram) == buckets::kCount * sizeof(std::uint64_t) + 24);
+}
+
+TEST_CASE("recording lands values in their own slot and counts them once") {
+    Histogram h;
+    h.record(Nanos(42));
+    h.record(Nanos(42));
+    h.record(Nanos(1000));
+
+    CHECK(h.count() == 3);
+    CHECK(h.overflow() == 0);
+    CHECK(h.slot(buckets::index_of(42)) == 2);
+    CHECK(h.slot(buckets::index_of(1000)) == 1);
+    CHECK(h.max() == Nanos(1000));
+}
+
+TEST_CASE("max is exact, not rounded up to a slot edge") {
+    Histogram h;
+    h.record(Micros(1500));  // 1,500,000ns — inside a slot, not on its edge
+    CHECK(h.max() == Nanos(1'500'000));
+    // The slot it landed in reports a higher value; max does not use it.
+    CHECK(buckets::slot_high(buckets::index_of(1'500'000)) > 1'500'000);
+}
+
+TEST_CASE("a value past 60s is counted, never clamped into the top slot") {
+    Histogram h;
+    h.record(Secs(90));
+
+    CHECK(h.count() == 1);
+    CHECK(h.overflow() == 1);
+    // Clamping would have reported a 90-second stall as 60 seconds.
+    CHECK(h.max() == Secs(90));
+    CHECK(h.slot(buckets::kCount - 1) == 0);
+}
+
+TEST_CASE("the boundary at 60s is inclusive, so only past it overflows") {
+    Histogram h;
+    h.record(Nanos(buckets::kMaxValue));
+    CHECK(h.overflow() == 0);
+    CHECK(h.slot(buckets::kCount - 1) == 1);
+
+    h.record(Nanos(buckets::kMaxValue + 1));
+    CHECK(h.overflow() == 1);
+    CHECK(h.count() == 2);
 }
