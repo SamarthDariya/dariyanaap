@@ -3,6 +3,7 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <optional>
 
 #include "core/units.hpp"
 #include "stats/buckets.hpp"
@@ -61,6 +62,25 @@ public:
     std::uint64_t slot(int index) const {
         return slots_[static_cast<std::size_t>(index)];
     }
+
+    // The p-th percentile, reporting the containing slot's HIGH edge — so a
+    // reported latency is never lower than the real one. The cost is a bias of
+    // at most 0.781%, always in the same direction, which is worth more than a
+    // smaller error pointing somewhere unknown (DESIGN.md decision 4).
+    //
+    // nullopt when nothing has been recorded. Not zero: a run whose requests
+    // all failed has no p99, and reporting 0ns would be an under-report of the
+    // most flattering possible kind. Same reasoning as Rate and Endpoint
+    // having no default — absence is std::optional, never a magic value.
+    //
+    // If the rank falls past 60s, into overflow(), the true value is somewhere
+    // in [60s, max()] and this returns max() — the conservative end. Callers
+    // reporting a run must print overflow() alongside, or the number looks
+    // more precise than it is.
+    //
+    // p is asserted, not validated: every caller in this repo passes a literal.
+    // A percentile arriving from a CLI flag is checked when the flag is parsed.
+    std::optional<Nanos> percentile(double p) const;
 
     // Deliberately absent: mean(). See DESIGN.md decision 3. The mean averages
     // a bimodal distribution whose two modes are "the fast path" and "the

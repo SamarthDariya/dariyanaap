@@ -1,7 +1,10 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <vector>
 
 #include "stats/buckets.hpp"
 #include "stats/histogram.hpp"
@@ -174,4 +177,107 @@ TEST_CASE("the boundary at 60s is inclusive, so only past it overflows") {
     h.record(Nanos(buckets::kMaxValue + 1));
     CHECK(h.overflow() == 1);
     CHECK(h.count() == 2);
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 1.4 — percentile()
+// ---------------------------------------------------------------------------
+
+TEST_CASE("an empty histogram has no percentile, rather than a flattering zero") {
+    const Histogram h;
+    CHECK_FALSE(h.percentile(50.0).has_value());
+    CHECK_FALSE(h.percentile(99.0).has_value());
+    // A run whose every request failed has no p99. Reporting 0ns would be the
+    // most flattering possible under-report.
+}
+
+TEST_CASE("one sample is every percentile") {
+    Histogram h;
+    h.record(Nanos(42));
+    CHECK(h.percentile(0.0).value() == Nanos(42));    // linear region: exact
+    CHECK(h.percentile(50.0).value() == Nanos(42));
+    CHECK(h.percentile(100.0).value() == Nanos(42));
+}
+
+TEST_CASE("percentiles are monotone, or p99 could come out below p50") {
+    Histogram h;
+    for (std::int64_t v = 1; v <= 10'000; ++v) {
+        h.record(Micros(v));
+    }
+    const Nanos p0 = h.percentile(0.0).value();
+    const Nanos p50 = h.percentile(50.0).value();
+    const Nanos p90 = h.percentile(90.0).value();
+    const Nanos p99 = h.percentile(99.0).value();
+    const Nanos p999 = h.percentile(99.9).value();
+    const Nanos p100 = h.percentile(100.0).value();
+
+    CHECK(p0 <= p50);
+    CHECK(p50 <= p90);
+    CHECK(p90 <= p99);
+    CHECK(p99 <= p999);
+    CHECK(p999 <= p100);
+}
+
+TEST_CASE("percentiles land within the bound of the exact answer") {
+    // 10,000 samples, one per microsecond from 1us to 10,000us, so the exact
+    // p-th percentile is p*100 microseconds and can be checked directly.
+    Histogram h;
+    for (std::int64_t v = 1; v <= 10'000; ++v) {
+        h.record(Micros(v));
+    }
+    for (const double p : {50.0, 90.0, 99.0, 99.9}) {
+        const std::int64_t exact = static_cast<std::int64_t>(p / 100.0 * 10'000.0) * 1'000;
+        const std::int64_t got = h.percentile(p).value().count();
+
+        // Never below the true value — the whole point of the high edge.
+        CHECK(got >= exact);
+        // And never further above it than the layout's 0.781% bound.
+        CHECK(static_cast<double>(got - exact) / static_cast<double>(exact) < 0.008);
+    }
+}
+
+TEST_CASE("percentile never reports below the exact value, at any p") {
+    // The guarantee, checked at every whole percentile rather than a few.
+    std::vector<std::int64_t> samples;
+    for (std::int64_t v = 1; v <= 2'000; ++v) {
+        samples.push_back(v * 137);  // spread across octaves, not round numbers
+    }
+    Histogram h;
+    for (const std::int64_t v : samples) {
+        h.record(Nanos(v));
+    }
+    std::sort(samples.begin(), samples.end());
+
+    for (int pi = 0; pi <= 100; ++pi) {
+        const double p = static_cast<double>(pi);
+        const std::size_t rank = static_cast<std::size_t>(
+            std::clamp<double>(std::ceil(p / 100.0 * 2000.0), 1.0, 2000.0));
+        const std::int64_t exact = samples[rank - 1];
+        REQUIRE(h.percentile(p).value().count() >= exact);
+    }
+}
+
+TEST_CASE("a rank in the overflow region reports max, not 60s") {
+    Histogram h;
+    for (int i = 0; i < 99; ++i) {
+        h.record(Micros(100));
+    }
+    h.record(Secs(90));  // the 100th sample: past the layout's top
+
+    CHECK(h.overflow() == 1);
+    // p50 is bucketed and unaffected.
+    CHECK(h.percentile(50.0).value() == Nanos(buckets::slot_high(buckets::index_of(100'000))));
+    // p100 falls past every slot. Returning 60s would under-report a
+    // 90-second stall by 30 seconds; max is the high end of [60s, max].
+    CHECK(h.percentile(100.0).value() == Secs(90));
+    CHECK(h.percentile(100.0).value() > Nanos(buckets::kMaxValue));
+}
+
+TEST_CASE("p100 is at least max, and max is the exact one to quote") {
+    Histogram h;
+    h.record(Micros(1500));
+    // p100 comes from a slot edge, so it rounds up; max() is exact. Both are
+    // correct answers to different questions, and neither is below the truth.
+    CHECK(h.percentile(100.0).value() >= h.max());
+    CHECK(h.max() == Nanos(1'500'000));
 }

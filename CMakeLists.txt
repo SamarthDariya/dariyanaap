@@ -90,12 +90,16 @@ add_library(dariyanaap::core ALIAS dariyanaap_core)
 # Library: stats
 # ---------------------------------------------------------------------------
 #
-# Depends on core and nothing else. Currently header-only — buckets.hpp is
-# constexpr arithmetic, deliberately inlined into the record path — so this is
-# an INTERFACE target until chunk 1.3 adds a translation unit.
+# Depends on core and nothing else. buckets.hpp and Histogram::record stay in
+# headers on purpose — they are constexpr arithmetic and the hot path, and a
+# call across a translation-unit boundary per sample would be measurement
+# overhead. Everything colder than that lives in a .cpp.
 
-add_library(dariyanaap_stats INTERFACE)
-target_link_libraries(dariyanaap_stats INTERFACE dariyanaap_core)
+add_library(dariyanaap_stats
+  src/stats/histogram.cpp
+)
+target_link_libraries(dariyanaap_stats PUBLIC dariyanaap_core)
+target_compile_options(dariyanaap_stats PRIVATE ${DARIYANAAP_WARNINGS})
 add_library(dariyanaap::stats ALIAS dariyanaap_stats)
 
 # M2 adds dariyanaap_load, M4 dariyanaap_fault.
