@@ -11,6 +11,26 @@ three supporting ones that exist to make E3 trustworthy.
 
 ---
 
+## E0 — Clock resolution, cold vs warm (M0)
+
+Not a planned experiment. `MonotonicClock::measured_resolution()` was written to be called at
+startup, and the number it returned turned out to depend on when it was called.
+
+- **Predicted:** nothing — this was not predicted, which is the point of recording it.
+- **Measured:** 90 ns as the first thing the process does · 39 ns after ~200M busy iterations ·
+  35 ns immediately after that. Inside the test suite, after other cases have run: 42 ns.
+- **Wrong about:** the cause. The code discards one clock read on the assumption that the *first
+  read* is slow (cold cache, first call into the commpage). That is real but minor. The dominant
+  effect is **CPU frequency scaling** — the core is idling at a low clock and takes time to boost,
+  and no amount of discarding single reads fixes that. 42 ns is one tick of the 24 MHz timebase,
+  so the warm figure is the hardware floor and the cold one is 2.5x too pessimistic.
+
+**Consequence:** resolution must be measured at the *end* of the warm-up window, not at process
+start, or decision 7 publishes a p99 floor more than twice too high into every later repo. Recorded
+in `DESIGN.md` decision 8. There is no caller yet — this becomes real code at M2.
+
+---
+
 ## E1 — Histogram accuracy (M1)
 
 Feed 1M samples from a known distribution (lognormal, plus a deliberate 1-in-1000 spike at 500ms) and
@@ -93,3 +113,5 @@ Numbers established here that later units quote rather than re-derive:
 | Rig p99 floor | | E2 |
 | Rig bottleneck concurrency | | E2 |
 | Histogram p99 error bound | | E1 |
+| Clock resolution (warm) | **42 ns** — one tick of the 24 MHz timebase | M0 |
+| Clock resolution (cold) | 90 ns — an artifact of CPU frequency scaling, not granularity | M0 |

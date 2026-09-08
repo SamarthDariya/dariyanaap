@@ -53,12 +53,12 @@ Full reasoning, with the rejected alternatives, in **[DESIGN.md](DESIGN.md)**.
 
 ## Status
 
-**Design: drafted.** **Implementation: M0 — skeleton.**
+**Design: drafted.** **Implementation: M0 complete, M1 next.**
 
 | Milestone | What lands | Effort | Status |
 |---|---|---|---|
-| M0 — Skeleton | build, sanitizers, ctest, units, clock | 0.5d | 🔸 in progress |
-| M1 — Histogram | HDR buckets, percentiles, merge, CSV | 0.5d | ⬜ |
+| M0 — Skeleton | build, sanitizers, ctest, units, clock | 0.5d | ✅ |
+| M1 — Histogram | HDR buckets, percentiles, merge, CSV | 0.5d | 🔸 next |
 | M2 — Closed-loop driver | thread-per-conn, HTTP + raw TCP, **self-calibration** | 1d | ⬜ |
 | M3 — Open-loop driver | `kqueue`, intended-send-time, **coordinated omission demo** | 1d | ⬜ |
 | M4 — Fault injection | the four primitives + a runtime control channel | 0.5d | ⬜ |
@@ -74,17 +74,27 @@ variables read at startup and skip the per-second timeseries in M5.
 Each milestone ends in something runnable or measurable, lives on its own `feature/*` branch, and is
 merged by PR.
 
-### M0 — Skeleton 🔸
+### M0 — Skeleton ✅
 - [x] CMake, C++20, warnings on by default
 - [x] ASan/UBSan and TSan build options, mutually exclusive
 - [x] doctest wired into `ctest` (header-only, no subproject build)
 - [x] builds as a submodule without forcing tests, CLI, or flags on the parent
-- [ ] `Micros` / `Rate` / `Duration` as strong types — no naked `int` that could be either
-- [ ] `MonotonicClock` — `steady_clock`, one wrapper, no `system_clock` anywhere in the repo
-- [ ] `Target` (host, port), `Endpoint` parsing with tests
-- [ ] suite green under ASan/UBSan and under TSan
+- [x] `Error` / `UsageError` / `InvalidEndpoint` — startup throws, the hot path will count
+- [x] durations are `chrono` aliases (`Nanos`/`Micros`/`Millis`/`Secs`), not hand-rolled wrappers
+- [x] `Rate` — always positive, no default; `due_at(i) = i/rate` computed, never accumulated
+- [x] `MonotonicClock` + `Stopwatch` — `steady_clock` only, no `system_clock` in `src/`
+- [x] `MonotonicClock::measured_resolution()` — **42 ns warm**, 90 ns cold
+- [x] `Endpoint` — validating constructor, strict `parse()` for `host:port` and `[::1]:8080`
+- [x] `-Werror` when top-level, off when vendored
+- [x] `scripts/check.sh` — build, test, sanitizers, and the `system_clock` ban in one command
+- [x] suite green: 23 cases, clean under ASan/UBSan **and** TSan
 
-### M1 — The histogram ⬜
+Two things on this list were not planned and were added because the work produced them: `-Werror`
+(a warning that only prints is invisible on the next incremental build, so it has to fail the
+compile) and the `Rate`/`Endpoint` rule that a value which exists is always valid — no default
+constructors, absence expressed as `std::optional`.
+
+### M1 — The histogram 🔸
 - [ ] log-linear (HDR-style) buckets, 2 significant digits, 1µs → 60s, fixed memory
 - [ ] `record()` on the hot path is branch-light and allocation-free
 - [ ] `percentile()`, `max()`, `count()` — **and no `mean()`**, deliberately absent
