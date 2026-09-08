@@ -1,6 +1,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <cstdint>
+
 #include "stats/buckets.hpp"
 
 using namespace dariyanaap;
@@ -20,4 +22,85 @@ TEST_CASE("the layout is self-consistent at its edges") {
     CHECK(buckets::slot_high(127) == 127);
     CHECK(buckets::slot_low(buckets::kCount - 1) <= buckets::kMaxValue);
     CHECK(buckets::slot_high(buckets::kCount - 1) >= buckets::kMaxValue);
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 1.2 — the layout, exhaustively. These are the tests that *derive*
+// DESIGN.md decision 4's error bound rather than quoting it.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("the linear region is exact, so a nanosecond is a nanosecond") {
+    for (std::int64_t v = 0; v < buckets::kSubBuckets; ++v) {
+        const int i = buckets::index_of(v);
+        REQUIRE(i == static_cast<int>(v));
+        REQUIRE(buckets::slot_low(i) == v);
+        REQUIRE(buckets::slot_high(i) == v);  // width 1: no error at all down here
+    }
+}
+
+TEST_CASE("indices never go backwards and never skip a slot") {
+    // A skipped slot is a value no sample can ever land in, which would make
+    // percentile() interpolate across a gap that does not exist.
+    int previous = buckets::index_of(0);
+    for (std::int64_t v = 1; v <= 3'000'000; ++v) {
+        const int i = buckets::index_of(v);
+        REQUIRE(i >= previous);
+        REQUIRE(i <= previous + 1);
+        previous = i;
+    }
+}
+
+TEST_CASE("indices stay monotone all the way to 60 seconds") {
+    // Multiplicative sweep: dense enough to cross every octave boundary.
+    int previous = 0;
+    std::int64_t v = 1;
+    while (v < buckets::kMaxValue) {
+        const int i = buckets::index_of(v);
+        REQUIRE(i >= previous);
+        previous = i;
+        v = v + v / 1000 + 1;
+    }
+    CHECK(buckets::index_of(buckets::kMaxValue) == buckets::kCount - 1);
+}
+
+TEST_CASE("every slot round-trips through its own bounds") {
+    for (int i = 0; i < buckets::kCount; ++i) {
+        const std::int64_t low = buckets::slot_low(i);
+        const std::int64_t high = buckets::slot_high(i);
+        REQUIRE(low <= high);
+        REQUIRE(buckets::index_of(low) == i);
+        REQUIRE(buckets::index_of(high) == i);
+    }
+}
+
+TEST_CASE("slots are contiguous, so the layout covers the range with no holes") {
+    for (int i = 0; i + 1 < buckets::kCount; ++i) {
+        REQUIRE(buckets::slot_high(i) + 1 == buckets::slot_low(i + 1));
+    }
+}
+
+TEST_CASE("the 0.781% bound is attained and never exceeded") {
+    // Reporting a slot's high edge over-reports by at most one slot width.
+    // This measures that, rather than trusting the arithmetic in the header.
+    double worst = 0.0;
+    std::int64_t worst_at = 0;
+    std::int64_t v = buckets::kSubBuckets;
+    while (v < buckets::kMaxValue) {
+        const double reported = static_cast<double>(buckets::slot_high(buckets::index_of(v)));
+        const double error = (reported - static_cast<double>(v)) / static_cast<double>(v);
+        if (error > worst) {
+            worst = error;
+            worst_at = v;
+        }
+        REQUIRE(error >= 0.0);  // high edge: never under-reports, ever
+        v = v + v / 3000 + 1;
+    }
+
+    // Never exceeded: this is the claim DESIGN.md decision 4 makes.
+    CHECK(worst <= 1.0 / static_cast<double>(buckets::kSubBuckets));
+    // And attained: a bound that is never approached would mean the layout is
+    // wasting memory on precision it does not deliver where it matters.
+    CHECK(worst > 0.99 / static_cast<double>(buckets::kSubBuckets));
+    CHECK(worst_at > 0);
+    MESSAGE("worst over-report " << worst * 100.0 << "% at " << worst_at << " ns");
 }
