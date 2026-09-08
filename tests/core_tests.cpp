@@ -2,9 +2,12 @@
 #include <doctest/doctest.h>
 
 #include <limits>
+#include <thread>
 #include <type_traits>
+#include <vector>
 
 #include "core/clock.hpp"
+#include "core/endpoint.hpp"
 #include "core/errors.hpp"
 #include "core/units.hpp"
 #include "core/version.hpp"
@@ -92,4 +95,65 @@ TEST_CASE("a rate prints as a number an operator would recognise") {
     // to_string(double) would render these as "1000.000000" and "0.500000".
     CHECK(Rate::per_second(1000.0).str() == "1000 rps");
     CHECK(Rate::per_second(0.5).str() == "0.5 rps");
+}
+
+// ---------------------------------------------------------------------------
+// Clock
+// ---------------------------------------------------------------------------
+
+TEST_CASE("the clock advances and never runs backwards") {
+    const MonotonicClock::Instant start = MonotonicClock::now();
+    MonotonicClock::Instant previous = start;
+    for (int i = 0; i < 100'000; ++i) {
+        const MonotonicClock::Instant current = MonotonicClock::now();
+        REQUIRE(current >= previous);  // REQUIRE: one inversion invalidates the rest
+        previous = current;
+    }
+    CHECK(MonotonicClock::since(start) > Nanos(0));
+}
+
+TEST_CASE("resolution is positive and finer than the histogram's bottom bucket") {
+    const Nanos resolution = MonotonicClock::measured_resolution();
+    CHECK(resolution > Nanos(0));
+
+    // Not a flaky assertion — an assumption check. The histogram's bottom
+    // bucket is 1us, so if this machine cannot distinguish intervals finer
+    // than that, every sub-microsecond latency the rig reports is quantisation
+    // noise and the CSV header would have to admit it. Better to fail here.
+    CHECK(resolution < Micros(1));
+}
+
+TEST_CASE("between and since measure the same interval") {
+    const MonotonicClock::Instant a = MonotonicClock::now();
+    std::this_thread::sleep_for(Millis(2));
+    const MonotonicClock::Instant b = MonotonicClock::now();
+
+    CHECK(MonotonicClock::between(a, b) >= Millis(2));
+    // since() reads the clock again, so it can only be longer.
+    CHECK(MonotonicClock::since(a) >= MonotonicClock::between(a, b));
+}
+
+TEST_CASE("a stopwatch measures the interval since it was made") {
+    Stopwatch watch;
+    std::this_thread::sleep_for(Millis(5));
+    CHECK(watch.elapsed() >= Millis(5));
+    CHECK(watch.start() < MonotonicClock::now());
+}
+
+TEST_CASE("the clock is safe to read from many threads at once") {
+    // The claim TSan is here to check. M1 depends on it: one histogram per
+    // thread, merged once at the end, nothing shared on the hot path.
+    std::vector<std::thread> threads;
+    std::vector<Nanos> elapsed(8, Nanos(0));
+    for (int t = 0; t < 8; ++t) {
+        threads.emplace_back([&elapsed, t] {
+            Stopwatch watch;
+            for (int i = 0; i < 10'000; ++i) {
+                (void)MonotonicClock::now();
+            }
+            elapsed[static_cast<size_t>(t)] = watch.elapsed();
+        });
+    }
+    for (std::thread& t : threads) t.join();
+    for (const Nanos e : elapsed) CHECK(e > Nanos(0));
 }

@@ -30,4 +30,14 @@ public:
     explicit UsageError(const std::string& what);
 };
 
+// A target could not be read from its textual form.
+//
+// Derived from UsageError, not beside it: an endpoint reaches the rig as a
+// command-line flag a human typed, so one `catch (const UsageError&)` in the
+// CLI prints a usage message for every way the invocation can be wrong.
+class InvalidEndpoint : public UsageError {
+public:
+    explicit InvalidEndpoint(const std::string& what);
+};
+
 }  // namespace dariyanaap
