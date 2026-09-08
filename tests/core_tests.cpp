@@ -157,3 +157,52 @@ TEST_CASE("the clock is safe to read from many threads at once") {
     for (std::thread& t : threads) t.join();
     for (const Nanos e : elapsed) CHECK(e > Nanos(0));
 }
+
+// ---------------------------------------------------------------------------
+// Endpoint — the type. Parsing arrives in 0.9.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("an endpoint that exists is one you could have connected to") {
+    const Endpoint e("127.0.0.1", 8080);
+    CHECK(e.host() == "127.0.0.1");
+    CHECK(e.port() == 8080);
+
+    // The invariants, enforced in the constructor rather than checked by
+    // whoever happens to use the value later.
+    CHECK_THROWS_AS((Endpoint("", 8080)), InvalidEndpoint);
+    CHECK_THROWS_AS((Endpoint("localhost", 0)), InvalidEndpoint);
+
+    // Catchable as a UsageError too, so one CLI handler covers every way the
+    // invocation can be wrong.
+    CHECK_THROWS_AS((Endpoint("localhost", 0)), UsageError);
+    CHECK_THROWS_AS((Endpoint("localhost", 0)), Error);
+}
+
+TEST_CASE("the error message names the host, since a run may have several") {
+    try {
+        Endpoint("backend-3.internal", 0);
+        FAIL("expected a throw");
+    } catch (const InvalidEndpoint& e) {
+        CHECK(std::string(e.what()).find("backend-3.internal") != std::string::npos);
+    }
+}
+
+TEST_CASE("ipv6 is detected by the colon and printed bracketed") {
+    const Endpoint v4("10.0.0.1", 9092);
+    CHECK_FALSE(v4.is_ipv6());
+    CHECK(v4.str() == "10.0.0.1:9092");
+
+    const Endpoint v6("::1", 9092);
+    CHECK(v6.is_ipv6());
+    CHECK(v6.str() == "[::1]:9092");
+
+    const Endpoint host("target.internal", 80);
+    CHECK_FALSE(host.is_ipv6());
+    CHECK(host.str() == "target.internal:80");
+}
+
+TEST_CASE("endpoints compare by host and port together") {
+    CHECK((Endpoint("a", 1) == Endpoint("a", 1)));
+    CHECK_FALSE((Endpoint("a", 1) == Endpoint("a", 2)));
+    CHECK_FALSE((Endpoint("a", 1) == Endpoint("b", 1)));
+}
