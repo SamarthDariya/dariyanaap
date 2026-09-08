@@ -4,11 +4,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <sstream>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include "stats/buckets.hpp"
 #include "stats/histogram.hpp"
+#include "stats/csv.hpp"
 #include "stats/summary.hpp"
 
 using namespace dariyanaap;
@@ -495,4 +498,159 @@ TEST_CASE("a summary of a merged histogram equals a summary of the whole") {
     CHECK(merged.p99 == single.p99);
     CHECK(merged.p999 == single.p999);
     CHECK(merged.max == single.max);
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 1.7 — CSV
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::vector<std::string> split(const std::string& line, char sep) {
+    std::vector<std::string> out;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= line.size(); ++i) {
+        if (i == line.size() || line[i] == sep) {
+            out.push_back(line.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> lines_of(const std::string& text) {
+    std::vector<std::string> out;
+    std::istringstream in(text);
+    std::string line;
+    while (std::getline(in, line)) {
+        out.push_back(line);
+    }
+    return out;
+}
+
+Histogram uniform(std::int64_t from, std::int64_t to) {
+    Histogram h;
+    for (std::int64_t v = from; v <= to; ++v) {
+        h.record(Micros(v));
+    }
+    return h;
+}
+
+}  // namespace
+
+TEST_CASE("the summary header names exactly as many columns as the row has fields") {
+    // The bug this catches is adding a field and forgetting the header, which
+    // silently shifts every column in every downstream plot.
+    const Histogram h = uniform(1, 100);
+    std::ostringstream out;
+    csv::write_summary_header(out);
+    csv::write_summary_row(out, Summary::of(h, Secs(1)).value());
+
+    const std::vector<std::string> rows = lines_of(out.str());
+    REQUIRE(rows.size() == 2);
+    CHECK(split(rows[0], ',').size() == split(rows[1], ',').size());
+    CHECK(split(rows[0], ',').size() == 10);
+}
+
+TEST_CASE("a sweep writes one header and one row per run") {
+    std::ostringstream out;
+    csv::write_summary_header(out);
+    for (const int connections : {1, 10, 100}) {
+        const Histogram h = uniform(1, connections * 10);
+        csv::write_summary_row(out, Summary::of(h, Secs(1)).value());
+    }
+    CHECK(lines_of(out.str()).size() == 4);  // header + 3 runs
+}
+
+TEST_CASE("throughput is written as a plain decimal, not in exponent form") {
+    Histogram h;
+    for (int i = 0; i < 1'200'000; ++i) {
+        h.record(Nanos(500));
+    }
+    std::ostringstream out;
+    csv::write_summary_row(out, Summary::of(h, Secs(1)).value());
+    // "1.2e+06" would be read as a string by most CSV consumers.
+    CHECK(out.str().find("e+") == std::string::npos);
+    CHECK(out.str().find("1200000.00") != std::string::npos);
+}
+
+TEST_CASE("the histogram file omits empty slots but keeps every sample") {
+    const Histogram h = uniform(1, 1'000);
+    std::ostringstream out;
+    csv::write_histogram(out, h);
+
+    const std::vector<std::string> rows = lines_of(out.str());
+    CHECK(rows[0] == "slot,low_ns,high_ns,count");
+    // Far fewer rows than slots: 1,000 samples cannot occupy 3,808 slots.
+    CHECK(rows.size() - 1 < static_cast<std::size_t>(buckets::kCount));
+
+    std::uint64_t total = 0;
+    for (std::size_t i = 1; i < rows.size(); ++i) {
+        total += std::stoull(split(rows[i], ',')[3]);
+    }
+    CHECK(total == h.count());  // the invariant the header promises
+}
+
+TEST_CASE("a run can be re-percentiled from its CSV alone") {
+    // This is decision 4's reason for storing raw counts instead of only
+    // percentiles: months later, without this binary, the file is enough.
+    const Histogram h = uniform(1, 10'000);
+    std::ostringstream out;
+    csv::write_histogram(out, h);
+
+    // Rebuild the distribution from the file and recompute p99 by hand.
+    const std::vector<std::string> rows = lines_of(out.str());
+    std::uint64_t total = 0;
+    for (std::size_t i = 1; i < rows.size(); ++i) {
+        total += std::stoull(split(rows[i], ',')[3]);
+    }
+    const std::uint64_t target = static_cast<std::uint64_t>(
+        std::ceil(0.99 * static_cast<double>(total)));
+
+    std::uint64_t running = 0;
+    std::int64_t p99_from_file = 0;
+    for (std::size_t i = 1; i < rows.size(); ++i) {
+        const std::vector<std::string> f = split(rows[i], ',');
+        running += std::stoull(f[3]);
+        if (running >= target) {
+            p99_from_file = std::stoll(f[2]);  // high_ns, same edge percentile() uses
+            break;
+        }
+    }
+    CHECK(p99_from_file == h.percentile(99.0).value().count());
+}
+
+TEST_CASE("samples past 60s get a row of their own, not a silent drop") {
+    Histogram h;
+    for (int i = 0; i < 10; ++i) {
+        h.record(Micros(100));
+    }
+    h.record(Secs(90));
+
+    std::ostringstream out;
+    csv::write_histogram(out, h);
+    const std::vector<std::string> rows = lines_of(out.str());
+    const std::vector<std::string> last = split(rows.back(), ',');
+
+    CHECK(last[0] == "-1");                              // no slot holds it
+    CHECK(std::stoll(last[1]) == buckets::kMaxValue + 1);
+    // Nanos(Secs(90)), not Secs(90).count(): count() returns the value in the
+    // duration's OWN units, so Secs(90).count() is 90. Calling count() throws
+    // away the unit checking that made chrono the right choice in units.hpp,
+    // which is why the CSV writer is the only place in the repo that calls it.
+    CHECK(std::stoll(last[2]) == Nanos(Secs(90)).count());  // the exact max
+    CHECK(last[3] == "1");
+
+    std::uint64_t total = 0;
+    for (std::size_t i = 1; i < rows.size(); ++i) {
+        total += std::stoull(split(rows[i], ',')[3]);
+    }
+    CHECK(total == h.count());  // still sums, overflow included
+}
+
+TEST_CASE("an empty histogram writes a header and nothing else") {
+    const Histogram empty;
+    std::ostringstream out;
+    csv::write_histogram(out, empty);
+    CHECK(lines_of(out.str()).size() == 1);
 }

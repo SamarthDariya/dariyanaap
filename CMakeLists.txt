@@ -98,6 +98,7 @@ add_library(dariyanaap::core ALIAS dariyanaap_core)
 add_library(dariyanaap_stats
   src/stats/histogram.cpp
   src/stats/summary.cpp
+  src/stats/csv.cpp
 )
 target_link_libraries(dariyanaap_stats PUBLIC dariyanaap_core)
 target_compile_options(dariyanaap_stats PRIVATE ${DARIYANAAP_WARNINGS})

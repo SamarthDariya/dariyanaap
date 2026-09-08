@@ -99,7 +99,9 @@ constructors, absence expressed as `std::optional`.
 - [ ] `record()` on the hot path is branch-light and allocation-free
 - [ ] `percentile()` reporting each slot's **high edge**, `max()`, `count()` — **and no `mean()`**
 - [ ] `merge()` — one histogram per thread, merged once at the end of the run
-- [ ] `Summary`: throughput, error rate, p50/p90/p99/p999/max, duration, rig-ceiling stamp
+- [ ] `Summary`: throughput, p50/p90/p99/p999/max, duration, overflow — **no error rate**,
+      because decision 6 counts errors by kind and four of the six kinds are HTTP facts
+      `stats` must not know; they live on `load`'s run result beside an `optional<Summary>`
 - [ ] CSV: one summary row + the raw bucket counts, so a run can be re-percentiled later
 - [ ] **verifier:** 1M samples from a known distribution — p99 within 1% of the exact value,
       memory flat, and the error bound *stated* rather than assumed
