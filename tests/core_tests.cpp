@@ -206,3 +206,82 @@ TEST_CASE("endpoints compare by host and port together") {
     CHECK_FALSE((Endpoint("a", 1) == Endpoint("a", 2)));
     CHECK_FALSE((Endpoint("a", 1) == Endpoint("b", 1)));
 }
+
+// ---------------------------------------------------------------------------
+// Endpoint::parse
+// ---------------------------------------------------------------------------
+
+TEST_CASE("parse accepts the forms an operator actually types") {
+    CHECK(Endpoint::parse("127.0.0.1:8080") == Endpoint("127.0.0.1", 8080));
+    CHECK(Endpoint::parse("localhost:1") == Endpoint("localhost", 1));
+    CHECK(Endpoint::parse("localhost:65535") == Endpoint("localhost", 65535));
+    CHECK(Endpoint::parse("a-target.internal:9092") == Endpoint("a-target.internal", 9092));
+    CHECK(Endpoint::parse("[::1]:8080") == Endpoint("::1", 8080));
+    CHECK(Endpoint::parse("[fe80::1%25en0]:80") == Endpoint("fe80::1%25en0", 80));
+}
+
+TEST_CASE("parse round-trips through str, so a CSV header is re-runnable") {
+    for (const char* text : {"127.0.0.1:8080", "localhost:80", "[::1]:9092"}) {
+        const Endpoint once = Endpoint::parse(text);
+        CHECK(once.str() == text);
+        CHECK(Endpoint::parse(once.str()) == once);
+    }
+}
+
+TEST_CASE("parse refuses a bad port rather than reading part of one") {
+    CHECK_THROWS_AS(Endpoint::parse("localhost"), InvalidEndpoint);       // no port at all
+    CHECK_THROWS_AS(Endpoint::parse("localhost:"), InvalidEndpoint);      // separator, no digits
+    CHECK_THROWS_AS(Endpoint::parse("localhost:0"), InvalidEndpoint);     // caught by the ctor
+    CHECK_THROWS_AS(Endpoint::parse("localhost:65536"), InvalidEndpoint); // one past the top
+    CHECK_THROWS_AS(Endpoint::parse("localhost:99999999999"), InvalidEndpoint);
+
+    // The three stoi would have accepted, returning 80 and reporting nothing.
+    CHECK_THROWS_AS(Endpoint::parse("localhost:80abc"), InvalidEndpoint);
+    CHECK_THROWS_AS(Endpoint::parse("localhost:+80"), InvalidEndpoint);
+    CHECK_THROWS_AS(Endpoint::parse("localhost: 80"), InvalidEndpoint);
+    CHECK_THROWS_AS(Endpoint::parse("localhost:-80"), InvalidEndpoint);
+}
+
+TEST_CASE("parse refuses input that is not a host:port pair") {
+    CHECK_THROWS_AS(Endpoint::parse(""), InvalidEndpoint);
+    CHECK_THROWS_AS(Endpoint::parse(":8080"), InvalidEndpoint);        // empty host, via the ctor
+    CHECK_THROWS_AS(Endpoint::parse("localhost :8080"), InvalidEndpoint);
+    CHECK_THROWS_AS(Endpoint::parse("local host:8080"), InvalidEndpoint);
+
+    // A URL is not an endpoint. "http://localhost:8080" would otherwise aim
+    // load at a host literally named "http:".
+    CHECK_THROWS_AS(Endpoint::parse("http://localhost:8080"), InvalidEndpoint);
+    CHECK_THROWS_AS(Endpoint::parse("localhost:8080/health"), InvalidEndpoint);
+    CHECK_THROWS_AS(Endpoint::parse("user@localhost:22"), InvalidEndpoint);
+}
+
+TEST_CASE("parse refuses ambiguous IPv6 instead of choosing a reading") {
+    // Is 8080 the port, or the address's last group? Both are defensible.
+    CHECK_THROWS_AS(Endpoint::parse("::1:8080"), InvalidEndpoint);
+    CHECK_THROWS_AS(Endpoint::parse("fe80::1"), InvalidEndpoint);
+
+    CHECK_THROWS_AS(Endpoint::parse("[::1]"), InvalidEndpoint);       // no port
+    CHECK_THROWS_AS(Endpoint::parse("[::1]8080"), InvalidEndpoint);   // no separator
+    CHECK_THROWS_AS(Endpoint::parse("[::1"), InvalidEndpoint);        // unclosed
+    CHECK_THROWS_AS(Endpoint::parse("[localhost]:8080"), InvalidEndpoint);  // brackets, no colon
+    CHECK_THROWS_AS(Endpoint::parse("[]:8080"), InvalidEndpoint);
+}
+
+TEST_CASE("a parse failure names the input and the reason") {
+    // These go straight to the operator's terminal, so they have to be read.
+    try {
+        Endpoint::parse("localhost:65536");
+        FAIL("expected a throw");
+    } catch (const InvalidEndpoint& e) {
+        const std::string what = e.what();
+        CHECK(what.find("localhost:65536") != std::string::npos);  // what they typed
+        CHECK(what.find("65535") != std::string::npos);            // what was wrong
+    }
+    try {
+        Endpoint::parse("::1:8080");
+        FAIL("expected a throw");
+    } catch (const InvalidEndpoint& e) {
+        // The message should say how to fix it, not just that it is wrong.
+        CHECK(std::string(e.what()).find("[::1]:8080") != std::string::npos);
+    }
+}

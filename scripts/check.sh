@@ -22,7 +22,21 @@ run_suite() {
     local dir="$1" label="$2"
     shift 2
     cmake -B "$dir" "$@" >/dev/null
-    cmake --build "$dir" -j >/dev/null
+
+    # Build output is captured rather than discarded: an earlier version sent it
+    # to /dev/null and a -Wunqualified-std-cast-call warning survived two
+    # chunks unnoticed. Warnings are the gate, not advice.
+    local log="$dir/.check-build.log"
+    if ! cmake --build "$dir" -j >"$log" 2>&1; then
+        cat "$log" >&2
+        echo "FAIL: $label build failed" >&2
+        exit 1
+    fi
+    if grep -E 'warning:' "$log"; then
+        echo "FAIL: $label built with warnings" >&2
+        exit 1
+    fi
+
     echo "--- $label ---"
     ctest --test-dir "$dir" --output-on-failure
 }

@@ -52,7 +52,20 @@ if(DARIYANAAP_TSAN)
   add_link_options(-fsanitize=thread)
 endif()
 
+# Warnings are errors when dariyanaap is the project being worked on, and only
+# then. Not strictness for its own sake — an incremental build re-emits nothing
+# for an unchanged file, so a warning that merely prints is caught once and
+# then invisible on every subsequent build. -Werror makes the object file fail
+# to exist, so the failure repeats until it is fixed.
+#
+# Off by default when vendored, so our strictness cannot break a parent repo
+# built with a newer compiler that warns about something we never saw.
+option(DARIYANAAP_WERROR "Treat warnings as errors" ${DARIYANAAP_IS_TOP_LEVEL})
+
 set(DARIYANAAP_WARNINGS -Wall -Wextra -Wpedantic)
+if(DARIYANAAP_WERROR)
+  list(APPEND DARIYANAAP_WARNINGS -Werror)
+endif()
 
 # ---------------------------------------------------------------------------
 # Library: core
