@@ -95,9 +95,9 @@ compile) and the `Rate`/`Endpoint` rule that a value which exists is always vali
 constructors, absence expressed as `std::optional`.
 
 ### M1 — The histogram 🔸
-- [ ] log-linear (HDR-style) buckets, 2 significant digits, 1µs → 60s, fixed memory
+- [ ] log-linear buckets, 128 sub-buckets per octave, **1ns → 60s**, 3,808 counters (29.75KB)
 - [ ] `record()` on the hot path is branch-light and allocation-free
-- [ ] `percentile()`, `max()`, `count()` — **and no `mean()`**, deliberately absent
+- [ ] `percentile()` reporting each slot's **high edge**, `max()`, `count()` — **and no `mean()`**
 - [ ] `merge()` — one histogram per thread, merged once at the end of the run
 - [ ] `Summary`: throughput, error rate, p50/p90/p99/p999/max, duration, rig-ceiling stamp
 - [ ] CSV: one summary row + the raw bucket counts, so a run can be re-percentiled later

@@ -92,9 +92,36 @@ contended row) the mean moves by a few percent while p99 moves by 50×.
 
 ### 4. HDR-style buckets, not samples, not sketches
 
-Log-linear buckets: two significant digits of precision from 1µs to 60s. Fixed memory (a few thousand
-counters), constant-time `record()`, no allocation on the hot path, and a stated error bound (≤1% of
-the reported value) rather than a hoped-for one.
+Log-linear buckets: **nanoseconds, from 1ns to 60s**, with **128 sub-buckets per power of two**.
+Fixed memory (3,808 counters, 29.75KB), constant-time `record()`, no allocation on the hot path, and an
+error bound that is derived rather than hoped for.
+
+*Amended after M0.* This decision originally said "two significant digits of precision from 1µs to
+60s", and both halves of that were wrong in a way that only showed up once there were numbers.
+
+**The unit is nanoseconds, not microseconds.** Decision 7 requires the rig to publish its own p99
+floor, and M0 measured the clock tick at 42ns. A histogram whose bottom bucket is 1µs cannot express
+the number decision 7 exists to report — it would have had to say "the rig's floor is under 1µs",
+which is the kind of non-answer this repo is meant to avoid. Extending the bottom to 1ns costs 10KB
+(2,528 counters → 3,808) and nothing else: values below the clock tick never occur, so those counters
+stay empty. Latency is still *reported* in microseconds; only the recording unit changed.
+
+**"Two significant digits" was a name, not a parameter.** The actual knob is the sub-bucket count,
+and the error bound is exactly `1/sub_buckets` when a bucket reports its high edge. Measured over a
+sweep to 6e10:
+
+| sub-buckets | counters | memory | worst over-report |
+|---|---|---|---|
+| 64 | 1,968 | 15.4KB | 1.562% — fails the ≤1% claim |
+| **128** | **3,808** | **29.8KB** | **0.781%** |
+| 256 | 7,360 | 57.5KB | 0.391% — twice the memory for accuracy nothing needs |
+
+The counter count is derived from the layout by `index_of(60s) + 1`, not from the octave-ceiling
+formula, which would over-allocate by 32 slots for a top octave that stops at 60s rather than 68.7s.
+
+So 128 is not inherited from HdrHistogram's defaults; it is the only value that satisfies the ≤1%
+bound without paying for precision no experiment in the track can use. The index arithmetic was
+verified monotone and gapless over a dense sweep of 1..3e6 and a sparse sweep to 6e10.
 
 Rejected alternatives:
 

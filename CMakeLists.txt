@@ -86,7 +86,19 @@ target_include_directories(dariyanaap_core PUBLIC src)
 target_compile_options(dariyanaap_core PRIVATE ${DARIYANAAP_WARNINGS})
 add_library(dariyanaap::core ALIAS dariyanaap_core)
 
-# M1 adds dariyanaap_stats, M2 dariyanaap_load, M4 dariyanaap_fault.
+# ---------------------------------------------------------------------------
+# Library: stats
+# ---------------------------------------------------------------------------
+#
+# Depends on core and nothing else. Currently header-only — buckets.hpp is
+# constexpr arithmetic, deliberately inlined into the record path — so this is
+# an INTERFACE target until chunk 1.3 adds a translation unit.
+
+add_library(dariyanaap_stats INTERFACE)
+target_link_libraries(dariyanaap_stats INTERFACE dariyanaap_core)
+add_library(dariyanaap::stats ALIAS dariyanaap_stats)
+
+# M2 adds dariyanaap_load, M4 dariyanaap_fault.
 # Each gets its own block here, and the layering is enforced by the build:
 # if core ever includes from load, it will not link.
 
@@ -120,9 +132,9 @@ if(DARIYANAAP_BUILD_TESTS)
 
   enable_testing()
 
-  foreach(suite core_tests)
+  foreach(suite core_tests stats_tests)
     add_executable(${suite} tests/${suite}.cpp)
-    target_link_libraries(${suite} PRIVATE dariyanaap_core doctest::doctest)
+    target_link_libraries(${suite} PRIVATE dariyanaap_stats doctest::doctest)
     target_include_directories(${suite} PRIVATE tests)
     target_compile_options(${suite} PRIVATE ${DARIYANAAP_WARNINGS})
     add_test(NAME ${suite} COMMAND ${suite})
