@@ -81,6 +81,7 @@ add_library(dariyanaap_core
   src/core/units.cpp
   src/core/clock.cpp
   src/core/endpoint.cpp
+  src/core/socket.cpp
 )
 target_include_directories(dariyanaap_core PUBLIC src)
 target_compile_options(dariyanaap_core PRIVATE ${DARIYANAAP_WARNINGS})

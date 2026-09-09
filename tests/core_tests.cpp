@@ -1,6 +1,10 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <limits>
 #include <thread>
 #include <type_traits>
@@ -9,6 +13,7 @@
 #include "core/clock.hpp"
 #include "core/endpoint.hpp"
 #include "core/errors.hpp"
+#include "core/socket.hpp"
 #include "core/units.hpp"
 #include "core/version.hpp"
 
@@ -284,4 +289,116 @@ TEST_CASE("a parse failure names the input and the reason") {
         // The message should say how to fix it, not just that it is wrong.
         CHECK(std::string(e.what()).find("[::1]:8080") != std::string::npos);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Socket
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// socketpair gives two connected fds with no listener, no port, and no chance
+// of a test colliding with something else on the machine.
+std::pair<int, int> connected_pair() {
+    int fds[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    return {fds[0], fds[1]};
+}
+
+bool is_open(int fd) {
+    return ::fcntl(fd, F_GETFD) != -1;
+}
+
+}  // namespace
+
+TEST_CASE("a socket cannot be copied, only moved") {
+    // Deleted rather than merely discouraged: two owners of one fd is a
+    // use-after-close that reads as a network error.
+    static_assert(!std::is_copy_constructible_v<Socket>);
+    static_assert(!std::is_copy_assignable_v<Socket>);
+    static_assert(std::is_move_constructible_v<Socket>);
+    static_assert(std::is_move_assignable_v<Socket>);
+    // And no default constructor: the only empty state is a moved-from one.
+    static_assert(!std::is_default_constructible_v<Socket>);
+}
+
+TEST_CASE("a socket owns its descriptor and closes it on destruction") {
+    const auto [a, b] = connected_pair();
+    {
+        const Socket s(a);
+        CHECK(s.valid());
+        CHECK(s.fd() == a);
+        CHECK(is_open(a));
+    }
+    CHECK_FALSE(is_open(a));
+    ::close(b);
+}
+
+TEST_CASE("moving transfers the descriptor and empties the source") {
+    const auto [a, b] = connected_pair();
+    Socket source(a);
+    Socket moved(std::move(source));
+
+    CHECK(moved.fd() == a);
+    CHECK(moved.valid());
+    CHECK_FALSE(source.valid());   // the residue of a move, and the only way here
+    CHECK(source.fd() == -1);
+    CHECK(is_open(a));             // the move must not have closed anything
+    ::close(b);
+}
+
+TEST_CASE("move-assignment closes what it is overwriting") {
+    // The classic move-assignment leak. Without the close, `a` stays open for
+    // the life of the process, and a run that reconnects on error would
+    // exhaust the fd table partway through and report it as target failures.
+    const auto [a, a_peer] = connected_pair();
+    const auto [b, b_peer] = connected_pair();
+
+    Socket holder(a);
+    Socket replacement(b);
+    holder = std::move(replacement);
+
+    CHECK(holder.fd() == b);
+    CHECK(is_open(b));
+    CHECK_FALSE(is_open(a));        // the overwritten descriptor is gone
+    CHECK_FALSE(replacement.valid());
+
+    ::close(a_peer);
+    ::close(b_peer);
+}
+
+TEST_CASE("self-move-assignment does not close the descriptor") {
+    const auto [a, b] = connected_pair();
+    Socket s(a);
+    Socket& alias = s;
+    s = std::move(alias);           // the this != &other guard earns its keep
+
+    CHECK(s.valid());
+    CHECK(is_open(a));
+    ::close(b);
+}
+
+TEST_CASE("close is idempotent, so an early close and a destructor agree") {
+    const auto [a, b] = connected_pair();
+    Socket s(a);
+    s.close();
+    CHECK_FALSE(s.valid());
+    CHECK_FALSE(is_open(a));
+    s.close();                      // must not close a descriptor the kernel reissued
+    CHECK_FALSE(s.valid());
+    ::close(b);
+}
+
+TEST_CASE("release hands the descriptor away without closing it") {
+    const auto [a, b] = connected_pair();
+    int taken = -1;
+    {
+        Socket s(a);
+        taken = s.release();
+        CHECK_FALSE(s.valid());
+    }
+    CHECK(taken == a);
+    CHECK(is_open(a));              // the destructor had nothing left to close
+    ::close(a);
+    ::close(b);
 }
