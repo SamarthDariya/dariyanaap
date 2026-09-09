@@ -30,6 +30,17 @@ public:
     explicit UsageError(const std::string& what);
 };
 
+// A syscall or library call failed for a reason outside the program's control:
+// DNS is down, the host refused the connection, the peer vanished.
+//
+// Not a UsageError: the invocation was fine and the world was not. The CLI
+// prints these as a failure, never as a usage message, because rerunning with
+// different flags is not the fix.
+class IoError : public Error {
+public:
+    explicit IoError(const std::string& what);
+};
+
 // A target could not be read from its textual form.
 //
 // Derived from UsageError, not beside it: an endpoint reaches the rig as a

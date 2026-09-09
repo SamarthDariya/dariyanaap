@@ -10,6 +10,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "core/address.hpp"
 #include "core/clock.hpp"
 #include "core/endpoint.hpp"
 #include "core/errors.hpp"
@@ -401,4 +402,64 @@ TEST_CASE("release hands the descriptor away without closing it") {
     CHECK(is_open(a));              // the destructor had nothing left to close
     ::close(a);
     ::close(b);
+}
+
+// ---------------------------------------------------------------------------
+// Address resolution
+// ---------------------------------------------------------------------------
+
+TEST_CASE("an address is a value, so one resolution can be shared by every connection") {
+    // Unlike Socket, SocketAddress owns nothing. That is the whole point: the
+    // runner resolves once and hands copies to 500 threads.
+    static_assert(std::is_copy_constructible_v<SocketAddress>);
+    static_assert(std::is_copy_assignable_v<SocketAddress>);
+}
+
+TEST_CASE("an IPv4 literal resolves to itself") {
+    const std::vector<SocketAddress> addrs = resolve(Endpoint::parse("127.0.0.1:8080"));
+    REQUIRE(addrs.size() >= 1);
+    CHECK(addrs[0].family() == AF_INET);
+    CHECK(addrs[0].str() == "127.0.0.1:8080");
+    CHECK(addrs[0].size() > 0);
+}
+
+TEST_CASE("an IPv6 literal resolves and prints bracketed") {
+    const std::vector<SocketAddress> addrs = resolve(Endpoint::parse("[::1]:9092"));
+    REQUIRE(addrs.size() >= 1);
+    CHECK(addrs[0].family() == AF_INET6);
+    CHECK(addrs[0].str() == "[::1]:9092");
+}
+
+TEST_CASE("a hostname resolves to at least one address") {
+    const std::vector<SocketAddress> addrs = resolve(Endpoint::parse("localhost:80"));
+    REQUIRE_FALSE(addrs.empty());
+    for (const SocketAddress& a : addrs) {
+        // Every address is usable and prints, whichever family it came back as.
+        REQUIRE((a.family() == AF_INET || a.family() == AF_INET6));
+        REQUIRE(a.str().find(":80") != std::string::npos);
+    }
+}
+
+TEST_CASE("a name that does not resolve is an IoError, not a usage error") {
+    // The invocation was fine and the world was not, so rerunning with
+    // different flags is not the fix and the CLI must not print usage.
+    CHECK_THROWS_AS(resolve(Endpoint::parse("no-such-host.invalid:80")), IoError);
+    CHECK_THROWS_AS(resolve(Endpoint::parse("no-such-host.invalid:80")), Error);
+
+    try {
+        resolve(Endpoint::parse("no-such-host.invalid:80"));
+        FAIL("expected a throw");
+    } catch (const IoError& e) {
+        // The message names the target, since a run may have several.
+        CHECK(std::string(e.what()).find("no-such-host.invalid:80") != std::string::npos);
+    }
+}
+
+TEST_CASE("the port survives resolution, since Endpoint already parsed it") {
+    for (const std::uint16_t port : {std::uint16_t{1}, std::uint16_t{8080}, std::uint16_t{65535}}) {
+        const std::vector<SocketAddress> addrs =
+            resolve(Endpoint("127.0.0.1", port));
+        REQUIRE_FALSE(addrs.empty());
+        CHECK(addrs[0].str() == "127.0.0.1:" + std::to_string(port));
+    }
 }

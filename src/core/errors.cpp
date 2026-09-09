@@ -12,4 +12,6 @@ UsageError::UsageError(const string& what) : Error(what) {}
 
 InvalidEndpoint::InvalidEndpoint(const string& what) : UsageError(what) {}
 
+IoError::IoError(const string& what) : Error(what) {}
+
 }  // namespace dariyanaap
