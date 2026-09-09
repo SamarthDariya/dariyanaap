@@ -1,5 +1,8 @@
 #pragma once
 
+#include "core/address.hpp"
+#include "core/units.hpp"
+
 namespace dariyanaap {
 
 // RAII owner of a socket file descriptor.
@@ -22,6 +25,22 @@ public:
     // Takes ownership. Asserts on a negative fd: that is a caller who did not
     // check the syscall's return value, which is a bug, not a runtime error.
     explicit Socket(int fd);
+
+    // Connect to one already-resolved address, giving up after `timeout`.
+    //
+    // Non-blocking connect plus poll, not a blocking connect, and the reason
+    // is a number: macOS's default connect timeout is about 75 seconds and
+    // cannot be shortened through any socket option. A rig whose connect can
+    // stall for 75s cannot measure M4's hang_forever() — it would hang
+    // alongside the target instead of recording that the target hung.
+    //
+    // Returns a socket back in BLOCKING mode. The non-blocking flag exists
+    // only to bound this call; reads and writes get their bound from
+    // SO_RCVTIMEO/SO_SNDTIMEO at chunk 2.3, which keeps the request path free
+    // of readiness bookkeeping until M3 genuinely needs it.
+    //
+    // Throws TimedOut if the timeout expires, IoError for anything else.
+    static Socket connect(const SocketAddress& address, Millis timeout);
     ~Socket();
 
     Socket(Socket&& other) noexcept;

@@ -41,6 +41,19 @@ public:
     explicit IoError(const std::string& what);
 };
 
+// A bounded wait expired.
+//
+// Derived from IoError so a generic handler still catches it, but distinct
+// because decision 6 counts timeouts separately from connect and read
+// failures. A target that hangs and a target that refuses are different
+// failures with different fixes, and unit 9's circuit breaker exists precisely
+// because slow is worse than down. Collapsing them into one counter would hide
+// the distinction the whole track is about.
+class TimedOut : public IoError {
+public:
+    explicit TimedOut(const std::string& what);
+};
+
 // A target could not be read from its textual form.
 //
 // Derived from UsageError, not beside it: an endpoint reaches the rig as a

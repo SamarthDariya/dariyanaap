@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -462,4 +463,121 @@ TEST_CASE("the port survives resolution, since Endpoint already parsed it") {
         REQUIRE_FALSE(addrs.empty());
         CHECK(addrs[0].str() == "127.0.0.1:" + std::to_string(port));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Socket::connect
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A listening socket on an ephemeral loopback port. Raw syscalls rather than
+// core::Listener, which is chunk 2.4 — connect has to be testable before the
+// thing it connects to is productised.
+struct TestListener {
+    int fd = -1;
+    std::uint16_t port = 0;
+
+    TestListener() {
+        fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(fd >= 0);
+        sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;  // let the kernel choose, so tests never collide
+        REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+        REQUIRE(::listen(fd, 16) == 0);
+
+        sockaddr_in bound = {};
+        socklen_t size = sizeof(bound);
+        REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &size) == 0);
+        port = ntohs(bound.sin_port);
+    }
+    ~TestListener() { if (fd >= 0) ::close(fd); }
+
+    TestListener(const TestListener&) = delete;
+    TestListener& operator=(const TestListener&) = delete;
+};
+
+std::uint16_t closed_port() {
+    // Bind, learn the port, then close it — so the port is known-free rather
+    // than guessed, and connecting to it refuses rather than reaching someone.
+    const TestListener probe;
+    return probe.port;
+}
+
+}  // namespace
+
+TEST_CASE("connecting to a listener succeeds and yields a live socket") {
+    const TestListener listener;
+    const std::vector<SocketAddress> addrs =
+        resolve(Endpoint("127.0.0.1", listener.port));
+    REQUIRE_FALSE(addrs.empty());
+
+    const Socket s = Socket::connect(addrs[0], Millis(1000));
+    CHECK(s.valid());
+    CHECK(s.fd() >= 0);
+}
+
+TEST_CASE("a connected socket comes back in blocking mode") {
+    // The non-blocking flag exists only to bound connect(). Leaving it set
+    // would make chunk 2.3's reads return EAGAIN instead of waiting, and the
+    // runner would count a healthy target as a read error.
+    const TestListener listener;
+    const Socket s = Socket::connect(
+        resolve(Endpoint("127.0.0.1", listener.port))[0], Millis(1000));
+
+    const int flags = ::fcntl(s.fd(), F_GETFL, 0);
+    REQUIRE(flags >= 0);
+    CHECK((flags & O_NONBLOCK) == 0);
+}
+
+TEST_CASE("connecting to a closed port is refused, and says so") {
+    const std::uint16_t port = closed_port();
+    const std::vector<SocketAddress> addrs = resolve(Endpoint("127.0.0.1", port));
+
+    CHECK_THROWS_AS(Socket::connect(addrs[0], Millis(1000)), IoError);
+    // Refused is NOT a timeout: decision 6 counts them separately, because a
+    // target that refuses and one that hangs need different responses.
+    CHECK_THROWS_AS(Socket::connect(addrs[0], Millis(1000)), Error);
+    try {
+        Socket::connect(addrs[0], Millis(1000));
+        FAIL("expected a throw");
+    } catch (const TimedOut&) {
+        FAIL("a refused connection must not be reported as a timeout");
+    } catch (const IoError& e) {
+        CHECK(std::string(e.what()).find("127.0.0.1:" + std::to_string(port)) !=
+              std::string::npos);
+    }
+}
+
+TEST_CASE("connect honours its timeout instead of the platform's 75 seconds") {
+    // 192.0.2.0/24 is TEST-NET-1: reserved, routed nowhere. Depending on the
+    // network it either black-holes (timeout) or is rejected immediately
+    // (unreachable), and both are correct here. What is asserted is the
+    // property that matters — connect returns on OUR schedule, not the
+    // platform's, because a 75s stall would make M4's hang_forever()
+    // unmeasurable.
+    const std::vector<SocketAddress> addrs = resolve(Endpoint("192.0.2.1", 80));
+    REQUIRE_FALSE(addrs.empty());
+
+    const Stopwatch watch;
+    CHECK_THROWS_AS(Socket::connect(addrs[0], Millis(150)), IoError);
+    CHECK(watch.elapsed() < Secs(2));
+}
+
+TEST_CASE("many connects in sequence do not leak descriptors") {
+    // The failure this catches is a throw path that skips close(). It shows up
+    // as a run that dies partway through with EMFILE and reports it as target
+    // failures. 300 iterations is well past any default soft limit.
+    const std::uint16_t port = closed_port();
+    const std::vector<SocketAddress> addrs = resolve(Endpoint("127.0.0.1", port));
+    for (int i = 0; i < 300; ++i) {
+        CHECK_THROWS_AS(Socket::connect(addrs[0], Millis(200)), IoError);
+    }
+    // If descriptors leaked, this final successful connect would fail.
+    const TestListener listener;
+    const Socket s = Socket::connect(
+        resolve(Endpoint("127.0.0.1", listener.port))[0], Millis(1000));
+    CHECK(s.valid());
 }

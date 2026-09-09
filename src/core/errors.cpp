@@ -14,4 +14,6 @@ InvalidEndpoint::InvalidEndpoint(const string& what) : UsageError(what) {}
 
 IoError::IoError(const string& what) : Error(what) {}
 
+TimedOut::TimedOut(const string& what) : IoError(what) {}
+
 }  // namespace dariyanaap
