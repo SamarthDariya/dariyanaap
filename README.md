@@ -53,13 +53,13 @@ Full reasoning, with the rejected alternatives, in **[DESIGN.md](DESIGN.md)**.
 
 ## Status
 
-**Design: drafted.** **Implementation: M0 complete, M1 next.**
+**Design: drafted.** **Implementation: M0–M1 complete, M2 next.**
 
 | Milestone | What lands | Effort | Status |
 |---|---|---|---|
 | M0 — Skeleton | build, sanitizers, ctest, units, clock | 0.5d | ✅ |
-| M1 — Histogram | HDR buckets, percentiles, merge, CSV | 0.5d | 🔸 next |
-| M2 — Closed-loop driver | thread-per-conn, HTTP + raw TCP, **self-calibration** | 1d | ⬜ |
+| M1 — Histogram | HDR buckets, percentiles, merge, CSV | 0.5d | ✅ |
+| M2 — Closed-loop driver | thread-per-conn, HTTP + raw TCP, **self-calibration** | 1d | 🔸 next |
 | M3 — Open-loop driver | `kqueue`, intended-send-time, **coordinated omission demo** | 1d | ⬜ |
 | M4 — Fault injection | the four primitives + a runtime control channel | 0.5d | ⬜ |
 | M5 — Output | CSV schema, plot script, submodule smoke test | 0.5d | ⬜ |
@@ -94,19 +94,27 @@ Two things on this list were not planned and were added because the work produce
 compile) and the `Rate`/`Endpoint` rule that a value which exists is always valid — no default
 constructors, absence expressed as `std::optional`.
 
-### M1 — The histogram 🔸
-- [ ] log-linear buckets, 128 sub-buckets per octave, **1ns → 60s**, 3,808 counters (29.75KB)
-- [ ] `record()` on the hot path is branch-light and allocation-free
-- [ ] `percentile()` reporting each slot's **high edge**, `max()`, `count()` — **and no `mean()`**
-- [ ] `merge()` — one histogram per thread, merged once at the end of the run
-- [ ] `Summary`: throughput, p50/p90/p99/p999/max, duration, overflow — **no error rate**,
-      because decision 6 counts errors by kind and four of the six kinds are HTTP facts
-      `stats` must not know; they live on `load`'s run result beside an `optional<Summary>`
-- [ ] CSV: one summary row + the raw bucket counts, so a run can be re-percentiled later
-- [ ] **verifier:** 1M samples from a known distribution — p99 within 1% of the exact value,
-      memory flat, and the error bound *stated* rather than assumed
+### M1 — The histogram ✅
+- [x] log-linear buckets, 128 sub-buckets per octave, **1ns → 60s**, 3,808 counters (29.75KB)
+- [x] `record()` allocation-free, one branch for overflow — **2.3 ns/op** measured
+- [x] `percentile()` reporting each slot's **high edge**, `max()` exact, `count()` — no `mean()`,
+      enforced by a `static_assert` on a concept rather than by a comment
+- [x] `merge()` — per-thread histograms, merged once; TSan verified to catch a shared one
+- [x] `Summary` — `optional`, because a run whose every request failed has no distribution.
+      **No error rate**: decision 6 counts errors by kind, four of the six kinds are HTTP facts
+      `stats` must not know, so they live on `load`'s run result beside an `optional<Summary>`
+- [x] CSV in **nanoseconds** — a µs column would record the rig's own floor as `0`. Raw slot
+      counts, and a test that re-derives p99 from the file text alone
+- [x] **verifier** (`apps/hist_verify.cpp`) — 1M samples, worst error **0.5434%** against a
+      0.7812% structural bound, memory flat at 30,488 bytes vs 8MB of samples (262×)
+- [x] suite green: 38 cases, clean under ASan/UBSan **and** TSan
 
-### M2 — Closed-loop driver ⬜
+Corrections this milestone made to the design, both recorded in `DESIGN.md` decision 4: the
+recording unit is nanoseconds, not microseconds (decision 7 needs a floor a µs layout cannot
+express), and "two significant digits" was a name rather than a parameter — the knob is sub-bucket
+count, and 128 is the only value meeting the ≤1% claim.
+
+### M2 — Closed-loop driver 🔸
 - [ ] `Protocol` interface: build a request, decide when a response is complete
 - [ ] `RawEcho` protocol (fixed-size ping/pong) and minimal HTTP/1.1 `GET` with `Content-Length`
 - [ ] thread-per-connection, blocking I/O, per-thread histogram
