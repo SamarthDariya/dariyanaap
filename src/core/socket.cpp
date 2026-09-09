@@ -143,4 +143,32 @@ Socket Socket::connect(const SocketAddress& address, Millis timeout) {
     return socket;
 }
 
+Socket Socket::connect_any(const vector<SocketAddress>& addresses, Millis timeout) {
+    // resolve() throws rather than returning an empty list, so an empty vector
+    // here is a caller who built one by hand — a bug, not a runtime failure.
+    assert(!addresses.empty() && "connect_any needs at least one address");
+
+    string failures;
+    bool every_attempt_timed_out = true;
+    for (const SocketAddress& address : addresses) {
+        try {
+            return connect(address, timeout);
+        } catch (const TimedOut& timed_out) {
+            // Caught before IoError, which it derives from. Reversing these
+            // two clauses would make the TimedOut branch dead code.
+            if (!failures.empty()) failures += "; ";
+            failures += timed_out.what();
+        } catch (const IoError& failed) {
+            every_attempt_timed_out = false;
+            if (!failures.empty()) failures += "; ";
+            failures += failed.what();
+        }
+    }
+
+    if (every_attempt_timed_out) {
+        throw TimedOut(failures);
+    }
+    throw IoError(failures);
+}
+
 }  // namespace dariyanaap

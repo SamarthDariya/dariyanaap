@@ -41,6 +41,27 @@ public:
     //
     // Throws TimedOut if the timeout expires, IoError for anything else.
     static Socket connect(const SocketAddress& address, Millis timeout);
+
+    // Try each address in order until one connects.
+    //
+    // Not a convenience wrapper — a correctness requirement. On this machine
+    // `localhost` resolves to [::1] FIRST and 127.0.0.1 second, so a rig that
+    // only tried addresses[0] would fail against an IPv4-only target that is
+    // running perfectly, and report it as the target refusing connections.
+    //
+    // The timeout is PER ADDRESS, so the worst case is timeout x addresses.
+    // A shared budget was the obvious alternative and is worse: a black-holed
+    // IPv6 address would consume the whole allowance and leave nothing for the
+    // IPv4 address that would have worked.
+    //
+    // Throws TimedOut only if EVERY attempt timed out — that is the one case
+    // where nothing definitive was learned. If any address refused, the target
+    // is reachable and declining, which is a connect failure and a different
+    // counter (decision 6). The message names every address tried and why each
+    // failed, because "connect failed" against a name with three addresses
+    // sends the operator to tcpdump.
+    static Socket connect_any(const std::vector<SocketAddress>& addresses,
+                              Millis timeout);
     ~Socket();
 
     Socket(Socket&& other) noexcept;

@@ -581,3 +581,101 @@ TEST_CASE("many connects in sequence do not leak descriptors") {
         resolve(Endpoint("127.0.0.1", listener.port))[0], Millis(1000));
     CHECK(s.valid());
 }
+
+// ---------------------------------------------------------------------------
+// Socket::connect_any
+// ---------------------------------------------------------------------------
+
+TEST_CASE("localhost connects to an IPv4-only target despite resolving IPv6 first") {
+    // The reason this chunk exists. On this machine:
+    //     localhost:80 -> [::1]:80 127.0.0.1:80
+    // and TestListener binds AF_INET only. A rig that tried addresses[0] and
+    // stopped would report a perfectly healthy target as refusing.
+    const TestListener listener;  // IPv4 only
+    const std::vector<SocketAddress> addrs =
+        resolve(Endpoint("localhost", listener.port));
+    REQUIRE(addrs.size() >= 2);
+    CHECK(addrs[0].family() == AF_INET6);  // the trap, confirmed present
+
+    const Socket s = Socket::connect_any(addrs, Millis(1000));
+    CHECK(s.valid());
+}
+
+TEST_CASE("a single good address still works") {
+    const TestListener listener;
+    const Socket s = Socket::connect_any(
+        resolve(Endpoint("127.0.0.1", listener.port)), Millis(1000));
+    CHECK(s.valid());
+}
+
+TEST_CASE("a bad address before a good one is skipped") {
+    const std::uint16_t dead = closed_port();
+    const TestListener listener;
+
+    std::vector<SocketAddress> addrs = resolve(Endpoint("127.0.0.1", dead));
+    for (const SocketAddress& a : resolve(Endpoint("127.0.0.1", listener.port))) {
+        addrs.push_back(a);
+    }
+
+    const Socket s = Socket::connect_any(addrs, Millis(1000));
+    CHECK(s.valid());
+}
+
+TEST_CASE("when everything fails, the message names every address and why") {
+    const std::uint16_t a = closed_port();
+    const std::uint16_t b = closed_port();
+
+    std::vector<SocketAddress> addrs = resolve(Endpoint("127.0.0.1", a));
+    for (const SocketAddress& x : resolve(Endpoint("127.0.0.1", b))) {
+        addrs.push_back(x);
+    }
+
+    try {
+        Socket::connect_any(addrs, Millis(500));
+        FAIL("expected a throw");
+    } catch (const IoError& e) {
+        const std::string what = e.what();
+        // Both attempts reported, not just the last. "connect failed" against
+        // a name with several addresses sends the operator to tcpdump.
+        CHECK(what.find("127.0.0.1:" + std::to_string(a)) != std::string::npos);
+        CHECK(what.find("127.0.0.1:" + std::to_string(b)) != std::string::npos);
+        CHECK(what.find(';') != std::string::npos);
+    }
+}
+
+TEST_CASE("a refusal anywhere means the failure is not a timeout") {
+    // Mixed outcomes: one address black-holes (times out), one refuses. Since
+    // something definitive was learned, this is a connect failure and belongs
+    // in a different counter than a target that never answered at all.
+    std::vector<SocketAddress> addrs = resolve(Endpoint("192.0.2.1", 80));
+    for (const SocketAddress& x : resolve(Endpoint("127.0.0.1", closed_port()))) {
+        addrs.push_back(x);
+    }
+
+    CHECK_THROWS_AS(Socket::connect_any(addrs, Millis(150)), IoError);
+    try {
+        Socket::connect_any(addrs, Millis(150));
+        FAIL("expected a throw");
+    } catch (const TimedOut&) {
+        FAIL("a mix of timeout and refusal must not be reported as a timeout");
+    } catch (const IoError&) {
+        // as intended
+    }
+}
+
+TEST_CASE("the per-address timeout means the worst case scales with the list") {
+    // Documented rather than hidden: two black-holed addresses at 150ms each
+    // takes ~300ms, not 150ms. The alternative — one shared budget — would let
+    // a dead IPv6 address consume the whole allowance and starve the IPv4 one
+    // that would have worked.
+    std::vector<SocketAddress> addrs = resolve(Endpoint("192.0.2.1", 80));
+    for (const SocketAddress& x : resolve(Endpoint("192.0.2.2", 80))) {
+        addrs.push_back(x);
+    }
+
+    const Stopwatch watch;
+    CHECK_THROWS_AS(Socket::connect_any(addrs, Millis(150)), IoError);
+    const Nanos elapsed = watch.elapsed();
+    CHECK(elapsed >= Millis(250));   // both were tried, not just the first
+    CHECK(elapsed < Secs(2));        // and still bounded
+}
