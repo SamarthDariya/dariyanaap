@@ -235,10 +235,11 @@ a bug waiting for the day you're tired.
 
 ```
 src/
-├── core/          units, MonotonicClock, Target/Endpoint, errors      → dariyanaap::core
-├── stats/         Histogram, Summary, CsvWriter                       → dariyanaap::stats
-├── load/          Protocol, Connection, ClosedLoopRunner,             → dariyanaap::load
-│                  OpenLoopRunner, EventLoop (kqueue), LoadPlan
+├── core/          units, MonotonicClock, Endpoint, errors,            → dariyanaap::core
+│                  Socket, Listener
+├── stats/         buckets, Histogram, Summary, csv                    → dariyanaap::stats
+├── load/          Protocol, ClosedLoopRunner, OpenLoopRunner,         → dariyanaap::load
+│                  EventLoop (kqueue), LoadPlan, RunResult
 └── fault/         knobs, control socket, the four primitives          → dariyanaap::fault
 apps/
 ├── dariyanaap.cpp        the CLI
@@ -253,6 +254,19 @@ dariyakyu uses, and the reason a layering violation is a build error rather than
 `fault` deliberately does **not** depend on `stats`. It gets linked into other people's services, and
 a fault knob that drags a histogram implementation into a Go-adjacent build is a nuisance nobody asked
 for.
+
+*Amended before M2.* The sockets were originally listed as `Connection` in `load`, which does not
+survive two of this design's own rules. `fault` links `core` only, and `drop_probability` and
+`hang_forever` have to close and stall connections — so a socket it cannot reach is a socket it
+cannot break. And `dariyanaap-null` is a **server**: it binds, listens and accepts, and putting a
+listener inside a library called `load` is backwards. So `Socket` and `Listener` are `core`: OS
+primitives with no dependencies, shared by the load driver, the calibration target, and the fault
+library. `load` keeps the protocols, the runners and the event loop — the things that are about
+generating load rather than about talking to a socket.
+
+The name `Connection` is dropped rather than moved. What `load` needs is a socket plus a protocol
+plus a histogram, and those three have different lifetimes; bundling them behind one noun was hiding
+that rather than expressing it.
 
 ### The concurrency model, and why it changes at M3
 

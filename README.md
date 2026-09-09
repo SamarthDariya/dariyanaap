@@ -158,6 +158,44 @@ count, and 128 is the only value meeting the ≤1% claim.
 
 ---
 
+## How this gets built — the chunk map
+
+Milestones are broken into chunks of 20–25 lines of code, each with its test and its reasoning,
+reviewed and committed one at a time. The reason is not caution: a 620-line milestone commit is
+unreviewable, and on this track the design decisions *are* the learning, so a chunk that lands
+without being argued over has failed even if it works. M0 was first written in one pass and
+reverted for exactly that.
+
+**M0 — 9 chunks, done.** errors · units.hpp · units.cpp · Rate tests · clock.hpp · clock.cpp +
+tests · endpoint.hpp · Endpoint the type · `parse()` + rejections.
+
+**M1 — 8 chunks, done.** bucket layout · layout tests · `Histogram` · `percentile()` · `merge()` ·
+`Summary` · CSV · verifier.
+
+**M2 — 13 chunks.** The first milestone with real I/O, so four chunks of socket plumbing land
+before anything measures anything.
+
+| Chunk | Lands | The decision in it |
+|---|---|---|
+| 2.1 | `core/Socket` — RAII fd, move-only | Move-only, not shared: two owners closing one fd is a use-after-close that reads as a network error |
+| 2.2 | `Socket::connect(Endpoint, timeout)` | **Non-blocking connect + `poll`.** Blocking connect cannot be timed out, and M4's `hang_forever()` is a target the rig has to survive rather than hang alongside |
+| 2.3 | `read_some` / `write_all`, `SO_RCVTIMEO` | A timeout is a **recorded** latency, not a dropped sample — dropping it is coordinated omission wearing another hat |
+| 2.4 | `core/Listener` — bind, listen, accept | Only the null target uses it, but it is `core` so `fault` can reach it at M4 |
+| 2.5 | `load/Protocol` + `RawEcho` | Two methods: build a request, decide whether a response is complete |
+| 2.6 | `Http11Get` — request bytes, status parse | No chunked encoding, no keep-alive negotiation, no TLS |
+| 2.7 | `Http11Get` — response completeness | `Content-Length` only, tested against canned bytes rather than a live server |
+| 2.8 | `ErrorCounts` (6 kinds) + `RunResult` | Where M1's `optional<Summary>` earns itself: a run with zero successes reports counts and no distribution |
+| 2.9 | One connection's request loop | Classifying each failure as one of the six kinds |
+| 2.10 | Thread pool, join, merge, warm-up | Warm-up excluded **by comparison, not by swapping histograms** — the clock is already read for latency, so `elapsed >= warmup` is free. `measured_resolution()` is called here, at the end of warm-up, per E0 |
+| 2.11 | `apps/dariyanaap_null.cpp` | Speaks `RawEcho` **only, not HTTP**: calibration has to minimise the *target's* work or E2 measures the server instead of the rig |
+| 2.12 | `apps/dariyanaap.cpp` — CLI, CSV out | First strings in the CSV, so escaping lands here — chunk 1.7 flagged it as owed |
+| 2.13 | **E2** — the concurrency sweep | 1 → 10 → 50 → 100 → 500 → 1000. Predict before running |
+
+Thirteen chunks against a 1-day budget is closer to 1.5–2 days, and 2.2 is over the line size on
+its own. Recorded rather than smoothed over.
+
+---
+
 ## Build
 
 ```sh
