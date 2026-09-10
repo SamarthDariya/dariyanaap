@@ -495,6 +495,14 @@ struct TestListener {
     }
     ~TestListener() { if (fd >= 0) ::close(fd); }
 
+    // Accept one pending connection. Raw fd, since the server half of these
+    // tests is scaffolding rather than something the rig ships.
+    int accept_one() const {
+        const int accepted = ::accept(fd, nullptr, nullptr);
+        REQUIRE(accepted >= 0);
+        return accepted;
+    }
+
     TestListener(const TestListener&) = delete;
     TestListener& operator=(const TestListener&) = delete;
 };
@@ -678,4 +686,122 @@ TEST_CASE("the per-address timeout means the worst case scales with the list") {
     const Nanos elapsed = watch.elapsed();
     CHECK(elapsed >= Millis(250));   // both were tried, not just the first
     CHECK(elapsed < Secs(2));        // and still bounded
+}
+
+// ---------------------------------------------------------------------------
+// Socket::read_some / write_all
+// ---------------------------------------------------------------------------
+
+TEST_CASE("a request written is a request read") {
+    const TestListener listener;
+    Socket client = Socket::connect_any(
+        resolve(Endpoint("127.0.0.1", listener.port)), Millis(1000));
+    const int server = listener.accept_one();
+
+    const std::string request = "PING";
+    client.write_all(std::span<const char>(request.data(), request.size()));
+
+    char buffer[16] = {};
+    const ssize_t got = ::recv(server, buffer, sizeof(buffer), 0);
+    REQUIRE(got == 4);
+    CHECK(std::string(buffer, 4) == "PING");
+
+    const std::string reply = "PONG";
+    REQUIRE(::send(server, reply.data(), reply.size(), 0) == 4);
+
+    char back[16] = {};
+    CHECK(client.read_some(std::span<char>(back, sizeof(back))) == 4);
+    CHECK(std::string(back, 4) == "PONG");
+    ::close(server);
+}
+
+TEST_CASE("a clean peer close reads as zero bytes, not as an error") {
+    // Whether a short response is a failure is a protocol question, so the
+    // socket reports the fact and lets chunk 2.9 decide what it means.
+    const TestListener listener;
+    Socket client = Socket::connect_any(
+        resolve(Endpoint("127.0.0.1", listener.port)), Millis(1000));
+    const int server = listener.accept_one();
+    ::close(server);
+
+    char buffer[16] = {};
+    CHECK(client.read_some(std::span<char>(buffer, sizeof(buffer))) == 0);
+}
+
+TEST_CASE("a read that expires throws TimedOut on our schedule") {
+    const TestListener listener;
+    Socket client = Socket::connect_any(
+        resolve(Endpoint("127.0.0.1", listener.port)), Millis(1000));
+    const int server = listener.accept_one();  // accepted, but never replies
+
+    client.set_timeouts(Millis(150), Millis(150));
+
+    char buffer[16] = {};
+    const Stopwatch watch;
+    CHECK_THROWS_AS(client.read_some(std::span<char>(buffer, sizeof(buffer))), TimedOut);
+    const Nanos elapsed = watch.elapsed();
+    CHECK(elapsed >= Millis(140));  // it really waited
+    CHECK(elapsed < Secs(1));       // and really gave up
+    ::close(server);
+}
+
+TEST_CASE("writing to a closed peer throws instead of killing the process") {
+    // Without SO_NOSIGPIPE this test does not fail — the whole binary dies of
+    // SIGPIPE. Unit 2 kills backends mid-run on purpose, so this is a normal
+    // path, not a rare one.
+    const TestListener listener;
+    Socket client = Socket::connect_any(
+        resolve(Endpoint("127.0.0.1", listener.port)), Millis(1000));
+    const int server = listener.accept_one();
+    ::close(server);
+
+    char buffer[16] = {};
+    CHECK(client.read_some(std::span<char>(buffer, sizeof(buffer))) == 0);  // sees the FIN
+
+    const std::string data = "REQUEST";
+    bool threw = false;
+    for (int attempt = 0; attempt < 5 && !threw; ++attempt) {
+        // A write after FIN is legal — TCP allows half-close — so the first
+        // one lands in the send buffer and succeeds. The peer's socket is
+        // fully closed, so it answers with RST, and the write after that
+        // fails. The sleep is what lets the RST arrive; without it all five
+        // attempts buffer and the test reports no error on a broken socket.
+        try {
+            client.write_all(std::span<const char>(data.data(), data.size()));
+        } catch (const IoError&) {
+            threw = true;
+        }
+        if (!threw) {
+            std::this_thread::sleep_for(Millis(20));
+        }
+    }
+    CHECK(threw);
+}
+
+TEST_CASE("write_all loops over partial writes for more than a buffer's worth") {
+    // 4MB is far past any socket send buffer, so send() will return short and
+    // the loop is the only reason all of it arrives.
+    constexpr std::size_t kSize = 4 * 1024 * 1024;
+    const TestListener listener;
+    Socket client = Socket::connect_any(
+        resolve(Endpoint("127.0.0.1", listener.port)), Millis(1000));
+    const int server = listener.accept_one();
+
+    std::size_t received = 0;
+    std::thread drain([server, &received] {
+        std::vector<char> buffer(64 * 1024);
+        for (;;) {
+            const ssize_t got = ::recv(server, buffer.data(), buffer.size(), 0);
+            if (got <= 0) break;
+            received += static_cast<std::size_t>(got);
+        }
+    });
+
+    const std::vector<char> payload(kSize, 'x');
+    client.write_all(std::span<const char>(payload.data(), payload.size()));
+    client.close();  // let the drain thread see EOF
+    drain.join();
+
+    CHECK(received == kSize);
+    ::close(server);
 }

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstddef>
+#include <span>
+
 #include "core/address.hpp"
 #include "core/units.hpp"
 
@@ -69,6 +72,31 @@ public:
 
     Socket(const Socket&) = delete;
     Socket& operator=(const Socket&) = delete;
+
+    // Bound every read and write. Called once after connect, never per
+    // request: setsockopt on the request path would be measured overhead.
+    //
+    // A read that expires throws TimedOut, which the runner records in the
+    // histogram AT the timeout value rather than dropping. Dropping it is
+    // coordinated omission arriving early — the request that took longest
+    // would be the one that never appears in the distribution.
+    void set_timeouts(Millis read_timeout, Millis write_timeout);
+
+    // Read whatever has arrived, up to buffer.size() bytes.
+    //
+    // Returns 0 for a clean peer close, and that is NOT an error here: whether
+    // a short response is a failure is a protocol question, so the decision
+    // belongs to whoever knows the protocol (chunk 2.9), not to the socket.
+    //
+    // Throws TimedOut if the read timeout expires, IoError otherwise.
+    std::size_t read_some(std::span<char> buffer);
+
+    // Write all of it, looping over partial writes.
+    //
+    // If this throws, an unknown prefix has already reached the peer, so the
+    // connection is unusable and the caller must drop it rather than send the
+    // next request down a stream the peer is misparsing.
+    void write_all(std::span<const char> data);
 
     int fd() const { return fd_; }
     bool valid() const { return fd_ >= 0; }

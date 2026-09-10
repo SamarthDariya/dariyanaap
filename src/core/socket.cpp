@@ -90,6 +90,21 @@ void await_writable(int fd, const SocketAddress& address, Millis timeout) {
     }
 }
 
+// Without this, writing to a socket the peer has closed raises SIGPIPE, whose
+// default disposition terminates the process. A load generator that dies the
+// first time a target closes a connection is not a load generator — and unit 2
+// deliberately kills backends mid-run, so this is not a rare path.
+//
+// SO_NOSIGPIPE is the BSD/macOS spelling. Linux has no such option and uses
+// MSG_NOSIGNAL per-send instead, so a Linux port changes this function and the
+// two send() calls, and nothing else.
+void disable_sigpipe(int fd) {
+    const int on = 1;
+    if (::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on)) < 0) {
+        throw IoError(string("setsockopt(SO_NOSIGPIPE): ") + strerror(errno));
+    }
+}
+
 void set_nonblocking(int fd, bool on) {
     const int flags = ::fcntl(fd, F_GETFL, 0);
     if (flags < 0) {
@@ -115,6 +130,7 @@ Socket Socket::connect(const SocketAddress& address, Millis timeout) {
     // and start reporting fd exhaustion as target failures.
     Socket socket(fd);
 
+    disable_sigpipe(fd);
     set_nonblocking(fd, true);
 
     if (::connect(fd, address.addr(), address.size()) != 0) {
@@ -169,6 +185,71 @@ Socket Socket::connect_any(const vector<SocketAddress>& addresses, Millis timeou
         throw TimedOut(failures);
     }
     throw IoError(failures);
+}
+
+void Socket::set_timeouts(Millis read_timeout, Millis write_timeout) {
+    assert(valid() && "set_timeouts on a moved-from socket");
+
+    auto apply = [this](int option, Millis value, const char* name) {
+        timeval tv = {};
+        tv.tv_sec = value.count() / 1000;
+        tv.tv_usec = static_cast<int>((value.count() % 1000) * 1000);
+        if (::setsockopt(fd_, SOL_SOCKET, option, &tv, sizeof(tv)) < 0) {
+            throw IoError(string("setsockopt(") + name + "): " + strerror(errno));
+        }
+    };
+    apply(SO_RCVTIMEO, read_timeout, "SO_RCVTIMEO");
+    apply(SO_SNDTIMEO, write_timeout, "SO_SNDTIMEO");
+}
+
+size_t Socket::read_some(span<char> buffer) {
+    assert(valid() && "read_some on a moved-from socket");
+    assert(!buffer.empty() && "read_some into an empty buffer reads nothing forever");
+
+    for (;;) {
+        const ssize_t got = ::recv(fd_, buffer.data(), buffer.size(), 0);
+        if (got >= 0) {
+            return static_cast<size_t>(got);
+        }
+        if (errno == EINTR) {
+            continue;  // a signal, not a network event
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // The socket is blocking (connect restored that), so EAGAIN here
+            // can only mean SO_RCVTIMEO expired. On a non-blocking socket the
+            // same errno would mean "nothing yet", which is why the blocking
+            // restore at the end of connect() is load-bearing rather than
+            // tidiness.
+            throw TimedOut("read timed out");
+        }
+        throw IoError(string("read: ") + strerror(errno));
+    }
+}
+
+void Socket::write_all(span<const char> data) {
+    assert(valid() && "write_all on a moved-from socket");
+
+    size_t sent = 0;
+    while (sent < data.size()) {
+        const ssize_t wrote = ::send(fd_, data.data() + sent, data.size() - sent, 0);
+        if (wrote > 0) {
+            sent += static_cast<size_t>(wrote);
+            continue;
+        }
+        if (wrote == 0) {
+            // send() returning 0 for a non-empty buffer should not happen on a
+            // stream socket. Looping on it would spin forever, so say so.
+            throw IoError("write made no progress");
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            throw TimedOut("write timed out after " + to_string(sent) + " of " +
+                           to_string(data.size()) + " bytes");
+        }
+        throw IoError(string("write: ") + strerror(errno));
+    }
 }
 
 }  // namespace dariyanaap
