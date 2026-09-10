@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <functional>
 #include <span>
 #include <string>
 #include <thread>
@@ -9,6 +10,7 @@
 #include "core/errors.hpp"
 #include "core/listener.hpp"
 #include "core/socket.hpp"
+#include "load/exchange.hpp"
 #include "load/http.hpp"
 #include "load/http11_get.hpp"
 #include "load/raw_echo.hpp"
@@ -545,4 +547,195 @@ TEST_CASE("an empty run is consistent, rather than a special case") {
     CHECK(result.consistent());
     CHECK(result.errors.total() == 0);
     CHECK_FALSE(result.latency.has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 2.9a — perform_request
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A target under the test's control: one thread, one connection, and the test
+// decides byte by byte what it replies with.
+class ScriptedTarget {
+public:
+    explicit ScriptedTarget(std::function<void(Socket&)> behaviour)
+        : listener_(Listener::bind_ephemeral("127.0.0.1")),
+          thread_([this, behaviour = std::move(behaviour)] {
+              Socket served = listener_.accept();
+              behaviour(served);
+          }) {}
+
+    ~ScriptedTarget() { if (thread_.joinable()) thread_.join(); }
+
+    Socket connect(Millis read_timeout = Millis(300)) {
+        Socket client = Socket::connect_any(
+            resolve(Endpoint("127.0.0.1", listener_.port())), Millis(1000));
+        client.set_timeouts(read_timeout, read_timeout);
+        return client;
+    }
+
+private:
+    Listener listener_;
+    std::thread thread_;
+};
+
+// Read the whole request, then reply with exactly `reply`.
+std::function<void(Socket&)> replies_with(std::string reply, std::size_t request_size) {
+    return [reply = std::move(reply), request_size](Socket& served) {
+        std::vector<char> buffer(4096);
+        std::size_t total = 0;
+        while (total < request_size) {
+            const std::size_t got = served.read_some(
+                std::span<char>(buffer.data(), buffer.size()));
+            if (got == 0) return;
+            total += got;
+        }
+        served.write_all(std::span<const char>(reply.data(), reply.size()));
+    };
+}
+
+}  // namespace
+
+TEST_CASE("a good exchange reports success, a duration, and a usable connection") {
+    const RawEcho protocol(64);
+    ScriptedTarget target(replies_with(std::string(64, 'a'), 64));
+    Socket client = target.connect();
+
+    std::vector<char> read_buffer(1024);
+    std::vector<char> received;
+    const Exchange result = perform_request(client, protocol, read_buffer, received);
+
+    CHECK(result.outcome == Outcome::Succeeded);
+    CHECK(result.elapsed > Nanos(0));
+    CHECK(result.connection_usable);
+}
+
+TEST_CASE("a reply arriving in pieces is assembled, not mistaken for short") {
+    const RawEcho protocol(200);
+    ScriptedTarget target([](Socket& served) {
+        std::vector<char> buffer(4096);
+        served.read_some(std::span<char>(buffer.data(), buffer.size()));
+        // Dribble the reply out in four writes with gaps, so consume() has to
+        // return NeedMore three times before it returns Complete.
+        const std::string chunk(50, 'a');
+        for (int i = 0; i < 4; ++i) {
+            served.write_all(std::span<const char>(chunk.data(), chunk.size()));
+            std::this_thread::sleep_for(Millis(5));
+        }
+    });
+    Socket client = target.connect(Millis(2000));
+
+    std::vector<char> read_buffer(64);  // smaller than the reply, on purpose
+    std::vector<char> received;
+    const Exchange result = perform_request(client, protocol, read_buffer, received);
+
+    CHECK(result.outcome == Outcome::Succeeded);
+    CHECK(received.size() == 200);
+    CHECK(result.elapsed >= Millis(15));  // it really waited for all four
+}
+
+TEST_CASE("a target that never replies is a timeout, and the connection is finished") {
+    const RawEcho protocol(16);
+    ScriptedTarget target([](Socket& served) {
+        std::vector<char> buffer(64);
+        served.read_some(std::span<char>(buffer.data(), buffer.size()));
+        std::this_thread::sleep_for(Millis(600));  // outlives the client's timeout
+    });
+    Socket client = target.connect(Millis(150));
+
+    std::vector<char> read_buffer(64);
+    std::vector<char> received;
+    const Exchange result = perform_request(client, protocol, read_buffer, received);
+
+    CHECK(result.outcome == Outcome::TimedOut);
+    // The actual elapsed time, not the configured timeout: necessarily at
+    // least the timeout, so it never under-reports.
+    CHECK(result.elapsed >= Millis(150));
+    // An unread reply may still be in flight, so reusing this connection would
+    // read it and report reply N's timing against request N+1.
+    CHECK_FALSE(result.connection_usable);
+}
+
+TEST_CASE("a peer that hangs up mid-reply is a read failure, not a timeout") {
+    const RawEcho protocol(100);
+    ScriptedTarget target([](Socket& served) {
+        std::vector<char> buffer(256);
+        served.read_some(std::span<char>(buffer.data(), buffer.size()));
+        const std::string partial(40, 'a');
+        served.write_all(std::span<const char>(partial.data(), partial.size()));
+        served.close();  // FIN before the other 60 bytes
+    });
+    Socket client = target.connect(Millis(500));
+
+    std::vector<char> read_buffer(256);
+    std::vector<char> received;
+    const Exchange result = perform_request(client, protocol, read_buffer, received);
+
+    CHECK(result.outcome == Outcome::ReadFailed);
+    CHECK_FALSE(result.connection_usable);
+}
+
+TEST_CASE("a desynchronised stream is a protocol error, not a long reply") {
+    const RawEcho protocol(10);
+    ScriptedTarget target(replies_with(std::string(25, 'a'), 10));  // 15 too many
+    Socket client = target.connect();
+
+    std::vector<char> read_buffer(256);
+    std::vector<char> received;
+    const Exchange result = perform_request(client, protocol, read_buffer, received);
+
+    CHECK(result.outcome == Outcome::ProtocolError);
+    CHECK_FALSE(result.connection_usable);
+}
+
+TEST_CASE("a non-2xx is a rejection with a real duration and a live connection") {
+    // The distinction decision 6 exists for: the target answered, promptly,
+    // and said no. Nothing is wrong with the connection.
+    const Http11Get protocol("h", "/");
+    ScriptedTarget target(replies_with(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        http::build_get("h", "/").size()));
+    Socket client = target.connect();
+
+    std::vector<char> read_buffer(1024);
+    std::vector<char> received;
+    const Exchange result = perform_request(client, protocol, read_buffer, received);
+
+    CHECK(result.outcome == Outcome::Rejected);
+    CHECK(result.elapsed > Nanos(0));
+    CHECK(result.connection_usable);   // a 503 is an answer, not a broken pipe
+}
+
+TEST_CASE("writing to a target that has gone is a write failure") {
+    const RawEcho protocol(32);
+    ScriptedTarget target([](Socket& served) { served.close(); });
+    Socket client = target.connect();
+
+    std::vector<char> read_buffer(256);
+    std::vector<char> received;
+
+    // The first write may land in the send buffer; the RST makes a later one
+    // fail. Either a write failure or a read failure is correct here — what
+    // must not happen is a success or a crash.
+    Outcome seen = Outcome::Succeeded;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        seen = perform_request(client, protocol, read_buffer, received).outcome;
+        if (seen == Outcome::WriteFailed || seen == Outcome::ReadFailed) break;
+        std::this_thread::sleep_for(Millis(20));
+    }
+    CHECK((seen == Outcome::WriteFailed || seen == Outcome::ReadFailed));
+}
+
+TEST_CASE("perform_request never throws, whatever the target does") {
+    // The caller counts by kind, so every failure has to arrive as an Outcome.
+    // An exception escaping here would have to be translated back into exactly
+    // this enum by every caller.
+    const RawEcho protocol(8);
+    ScriptedTarget target([](Socket& served) { served.close(); });
+    Socket client = target.connect(Millis(100));
+
+    std::vector<char> read_buffer(64);
+    std::vector<char> received;
+    CHECK_NOTHROW(perform_request(client, protocol, read_buffer, received));
 }
