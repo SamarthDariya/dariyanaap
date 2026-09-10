@@ -10,6 +10,7 @@
 #include "core/listener.hpp"
 #include "core/socket.hpp"
 #include "load/http.hpp"
+#include "load/http11_get.hpp"
 #include "load/raw_echo.hpp"
 
 using namespace dariyanaap;
@@ -280,4 +281,153 @@ TEST_CASE("a content length too large to be a body is refused, not wrapped") {
               "HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999") == std::nullopt);
     CHECK(http::content_length(
               "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615") == 18446744073709551615ull);
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 2.7b — Http11Get
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string ok_response(const std::string& body) {
+    return "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
+           "\r\n\r\n" + body;
+}
+
+}  // namespace
+
+TEST_CASE("the request is the one http::build_get produces") {
+    const Http11Get protocol("target.internal", "/health");
+    const std::span<const char> request = protocol.request();
+    CHECK(std::string(request.begin(), request.end()) ==
+          http::build_get("target.internal", "/health"));
+    CHECK(protocol.request().data() == protocol.request().data());  // not rebuilt
+}
+
+TEST_CASE("a bad host or path is refused at construction, before the run") {
+    CHECK_THROWS_AS((Http11Get("", "/")), UsageError);
+    CHECK_THROWS_AS((Http11Get("host", "no-slash")), UsageError);
+    CHECK_THROWS_AS((Http11Get("host\r\nX: y", "/")), UsageError);
+}
+
+TEST_CASE("a response is complete only when the declared body has all arrived") {
+    const Http11Get protocol("h", "/");
+    const std::string full = ok_response("hello");
+
+    CHECK(protocol.consume(bytes_of("HTTP/1.1 200 OK\r\n")) == ResponseState::NeedMore);
+    CHECK(protocol.consume(bytes_of("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")) ==
+          ResponseState::NeedMore);
+    CHECK(protocol.consume(bytes_of(full.substr(0, full.size() - 1))) ==
+          ResponseState::NeedMore);
+    CHECK(protocol.consume(bytes_of(full)) == ResponseState::Complete);
+    CHECK(protocol.succeeded(bytes_of(full)));
+}
+
+TEST_CASE("feeding one byte at a time completes at exactly the right total") {
+    // What TCP actually does when a response spans segments. Complete must
+    // happen on the last byte and not one before or after it.
+    const Http11Get protocol("h", "/");
+    const std::string full = ok_response("a body of some length");
+
+    std::string received;
+    for (std::size_t i = 0; i < full.size(); ++i) {
+        received.push_back(full[i]);
+        const ResponseState state = protocol.consume(bytes_of(received));
+        if (i + 1 < full.size()) {
+            REQUIRE(state == ResponseState::NeedMore);
+        } else {
+            REQUIRE(state == ResponseState::Complete);
+        }
+    }
+}
+
+TEST_CASE("bytes past the declared body are a desynchronised stream") {
+    // Not a long response. The extra bytes are the head of a second reply, so
+    // continuing would attribute reply N's timing to request N+1.
+    const Http11Get protocol("h", "/");
+    CHECK(protocol.consume(bytes_of(ok_response("hello") + "H")) ==
+          ResponseState::Malformed);
+    CHECK(protocol.consume(bytes_of(ok_response("hello") + ok_response("world"))) ==
+          ResponseState::Malformed);
+}
+
+TEST_CASE("a 200 with no Content-Length cannot be framed, so it is a protocol error") {
+    // Guessing where the body ends is what produces silently wrong numbers.
+    const Http11Get protocol("h", "/");
+    CHECK(protocol.consume(bytes_of("HTTP/1.1 200 OK\r\nServer: x\r\n\r\nbody")) ==
+          ResponseState::Malformed);
+    CHECK(protocol.consume(bytes_of("HTTP/1.1 200 OK\r\nServer: x\r\n\r\n")) ==
+          ResponseState::Malformed);
+}
+
+TEST_CASE("statuses defined to carry no body complete at the end of their headers") {
+    // Without this a target legitimately answering 204 would be counted as a
+    // protocol error, which is exactly the misattribution decision 6 forbids.
+    const Http11Get protocol("h", "/");
+    CHECK(protocol.consume(bytes_of("HTTP/1.1 204 No Content\r\nServer: x\r\n\r\n")) ==
+          ResponseState::Complete);
+    CHECK(protocol.consume(bytes_of("HTTP/1.1 304 Not Modified\r\n\r\n")) ==
+          ResponseState::Complete);
+    CHECK(protocol.consume(bytes_of("HTTP/1.1 100 Continue\r\n\r\n")) ==
+          ResponseState::Complete);
+
+    // A 204 is still a success, and bytes after it are still a desync.
+    CHECK(protocol.succeeded(bytes_of("HTTP/1.1 204 No Content\r\n\r\n")));
+    CHECK(protocol.consume(bytes_of("HTTP/1.1 204 No Content\r\n\r\nx")) ==
+          ResponseState::Malformed);
+}
+
+TEST_CASE("chunked encoding is refused by name rather than mis-framed") {
+    const Http11Get protocol("h", "/");
+    CHECK(protocol.consume(bytes_of(
+              "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")) ==
+          ResponseState::Malformed);
+    // Even with a Content-Length alongside it, which is itself a broken
+    // response: RFC 9112 says Transfer-Encoding wins and the message is
+    // suspect. Refusing is the only reading that cannot desynchronise.
+    CHECK(protocol.consume(bytes_of(
+              "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello")) ==
+          ResponseState::Malformed);
+}
+
+TEST_CASE("a target that never sends a blank line is bounded, not accumulated") {
+    const Http11Get protocol("h", "/");
+    std::string babble = "HTTP/1.1 200 OK\r\n";
+    babble += std::string(Http11Get::kMaxHeaderBytes / 2, 'x');
+    CHECK(protocol.consume(bytes_of(babble)) == ResponseState::NeedMore);
+
+    babble += std::string(Http11Get::kMaxHeaderBytes, 'x');
+    CHECK(protocol.consume(bytes_of(babble)) == ResponseState::Malformed);
+}
+
+TEST_CASE("success is 2xx, and a redirect is a complete response that failed") {
+    const Http11Get protocol("h", "/");
+    auto complete = [](int status, const std::string& body) {
+        return "HTTP/1.1 " + std::to_string(status) + " X\r\nContent-Length: " +
+               std::to_string(body.size()) + "\r\n\r\n" + body;
+    };
+
+    for (const int status : {200, 201, 204, 299}) {
+        const std::string response = status == 204 ? "HTTP/1.1 204 X\r\n\r\n"
+                                                   : complete(status, "b");
+        REQUIRE(protocol.consume(bytes_of(response)) == ResponseState::Complete);
+        REQUIRE(protocol.succeeded(bytes_of(response)));
+    }
+    // 3xx: decision 11 excludes redirects, so following one is not on the
+    // table, and counting it as a success would report a target that never
+    // served the request as having served it.
+    for (const int status : {300, 301, 400, 404, 500, 503}) {
+        const std::string response = complete(status, "b");
+        REQUIRE(protocol.consume(bytes_of(response)) == ResponseState::Complete);
+        REQUIRE_FALSE(protocol.succeeded(bytes_of(response)));
+    }
+}
+
+TEST_CASE("Http11Get is usable through the Protocol interface, like the runner will") {
+    const Http11Get concrete("h", "/");
+    const Protocol& protocol = concrete;
+    const std::string full = ok_response("hi");
+    CHECK(protocol.request().size() > 0);
+    CHECK(protocol.consume(bytes_of(full)) == ResponseState::Complete);
+    CHECK(protocol.succeeded(bytes_of(full)));
 }
