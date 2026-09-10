@@ -77,6 +77,14 @@ compare the histogram's percentiles against exact percentiles from the sorted sa
 `dariyanaap` (closed-loop) against `dariyanaap-null`, which replies immediately. Ramp connections
 1 → 10 → 50 → 100 → 500 → 1000.
 
+**Platform constraint measured before the run (M2, chunk 2.4b):**
+`kern.ipc.somaxconn` on this machine is **128**, and macOS clamps `listen(backlog)` to it silently —
+asking for 1024 is not an error and produces no warning, it just gets you 128. So a ramp to 1000
+connections offers far more pending connects than the accept queue holds, and the surplus is refused
+or dropped. **That is a rig artifact, not a target failure**, and counting it as one would corrupt
+the very number this experiment exists to establish. Either ramp connections gradually, or raise the
+limit with `sudo sysctl -w kern.ipc.somaxconn=2048` and say in the results which was done.
+
 - **Predicted:** max throughput ___ rps · p99 floor ___ µs · rig becomes the bottleneck at ___ conns
 - **Measured:**
 - **Wrong about:**

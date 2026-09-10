@@ -15,6 +15,7 @@
 #include "core/clock.hpp"
 #include "core/endpoint.hpp"
 #include "core/errors.hpp"
+#include "core/listener.hpp"
 #include "core/socket.hpp"
 #include "core/units.hpp"
 #include "core/version.hpp"
@@ -876,4 +877,105 @@ TEST_CASE("an adopted socket survives writing to a peer that has gone") {
         }
     }
     CHECK(threw);
+}
+
+// ---------------------------------------------------------------------------
+// Listener
+// ---------------------------------------------------------------------------
+
+TEST_CASE("a listener is move-only, like the socket it owns") {
+    static_assert(!std::is_copy_constructible_v<Listener>);
+    static_assert(std::is_move_constructible_v<Listener>);
+    static_assert(!std::is_default_constructible_v<Listener>);
+}
+
+TEST_CASE("an ephemeral bind reports the port the kernel chose") {
+    const Listener listener = Listener::bind_ephemeral("127.0.0.1");
+    CHECK(listener.port() != 0);          // the whole point of asking
+    CHECK(listener.fd() >= 0);
+    CHECK(listener.address().str() == "127.0.0.1:" + std::to_string(listener.port()));
+}
+
+TEST_CASE("a client connects, the listener accepts, and bytes flow both ways") {
+    Listener listener = Listener::bind_ephemeral("127.0.0.1");
+
+    std::thread client_side([port = listener.port()] {
+        Socket client = Socket::connect_any(
+            resolve(Endpoint("127.0.0.1", port)), Millis(1000));
+        const std::string request = "PING";
+        client.write_all(std::span<const char>(request.data(), request.size()));
+        char reply[8] = {};
+        const std::size_t got = client.read_some(std::span<char>(reply, sizeof(reply)));
+        REQUIRE(got == 4);
+        REQUIRE(std::string(reply, 4) == "PONG");
+    });
+
+    Socket served = listener.accept();
+    char buffer[8] = {};
+    CHECK(served.read_some(std::span<char>(buffer, sizeof(buffer))) == 4);
+    CHECK(std::string(buffer, 4) == "PING");
+    const std::string reply = "PONG";
+    served.write_all(std::span<const char>(reply.data(), reply.size()));
+
+    client_side.join();
+}
+
+TEST_CASE("an accepted socket has SIGPIPE suppressed, since accept does not inherit it") {
+    Listener listener = Listener::bind_ephemeral("127.0.0.1");
+    std::thread client_side([port = listener.port()] {
+        const Socket client = Socket::connect_any(
+            resolve(Endpoint("127.0.0.1", port)), Millis(1000));
+        // Connect and immediately hang up — what a load generator does to a
+        // target at the end of every run.
+    });
+
+    const Socket served = listener.accept();
+    int value = 0;
+    socklen_t size = sizeof(value);
+    REQUIRE(::getsockopt(served.fd(), SOL_SOCKET, SO_NOSIGPIPE, &value, &size) == 0);
+    CHECK(value != 0);
+    client_side.join();
+}
+
+TEST_CASE("a port left in TIME_WAIT can be rebound immediately") {
+    // What SO_REUSEADDR actually buys. E2 restarts the null target between
+    // every step of the concurrency sweep, so without this the sweep fails
+    // partway through with an error that looks like a bug in the rig.
+    std::uint16_t port = 0;
+    {
+        Listener first = Listener::bind_ephemeral("127.0.0.1");
+        port = first.port();
+
+        // Make it a real connection so the port enters TIME_WAIT rather than
+        // just being released.
+        std::thread client_side([port] {
+            const Socket c = Socket::connect_any(
+                resolve(Endpoint("127.0.0.1", port)), Millis(1000));
+        });
+        const Socket served = first.accept();
+        client_side.join();
+    }
+
+    // Same port, immediately. EADDRINUSE here would mean SO_REUSEADDR is gone.
+    const Listener second = Listener::bind(Endpoint("127.0.0.1", port));
+    CHECK(second.port() == port);
+}
+
+TEST_CASE("two live listeners cannot share a port, REUSEADDR or not") {
+    // SO_REUSEADDR relaxes TIME_WAIT, not active binds. Worth pinning, because
+    // if it ever did allow this, two null targets would silently split the
+    // connections and E2 would measure something that does not exist.
+    const Listener first = Listener::bind_ephemeral("127.0.0.1");
+    CHECK_THROWS_AS(Listener::bind(Endpoint("127.0.0.1", first.port())), IoError);
+}
+
+TEST_CASE("binding a port that needs privilege fails as an IoError") {
+    // Port 1 needs root. The message must name the address, since a target
+    // misconfiguration is the operator's to fix.
+    try {
+        Listener::bind(Endpoint("127.0.0.1", 1));
+        // Running as root is possible; not a failure of the code.
+    } catch (const IoError& e) {
+        CHECK(std::string(e.what()).find("127.0.0.1:1") != std::string::npos);
+    }
 }
