@@ -9,6 +9,7 @@
 #include "core/errors.hpp"
 #include "core/listener.hpp"
 #include "core/socket.hpp"
+#include "load/http.hpp"
 #include "load/raw_echo.hpp"
 
 using namespace dariyanaap;
@@ -117,4 +118,84 @@ TEST_CASE("a request goes out and an echo comes back through real sockets") {
     CHECK(std::string(received.begin(), received.end()) ==
           std::string(protocol.request().begin(), protocol.request().end()));
     echo_server.join();
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 2.6 — http::build_get and http::status_code
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::span<const char> bytes_of(const std::string& text) {
+    return {text.data(), text.size()};
+}
+
+}  // namespace
+
+TEST_CASE("a GET request is exactly the bytes a server expects") {
+    const std::string request = http::build_get("target.internal", "/health");
+    CHECK(request ==
+          "GET /health HTTP/1.1\r\n"
+          "Host: target.internal\r\n"
+          "User-Agent: dariyanaap 0.1.0\r\n"
+          "Accept: */*\r\n"
+          "\r\n");
+    // A request not terminated by a blank line leaves the server waiting for
+    // more headers, and the run reports a read timeout against a healthy target.
+    CHECK(request.ends_with("\r\n\r\n"));
+}
+
+TEST_CASE("the request does not close the connection or offer compression") {
+    const std::string request = http::build_get("h", "/");
+    // Closing per request would measure TCP setup instead of request handling,
+    // and would hide unit 1's thread-per-request collapse behind handshakes.
+    CHECK(request.find("Connection:") == std::string::npos);
+    // Offering gzip invites a compressed response, and decompressing it would
+    // put the rig's CPU on the measured path as though the target caused it.
+    CHECK(request.find("Accept-Encoding") == std::string::npos);
+}
+
+TEST_CASE("a request that could not be well-formed is refused before the run") {
+    CHECK_THROWS_AS(http::build_get("", "/"), UsageError);
+    CHECK_THROWS_AS(http::build_get("host", ""), UsageError);
+    CHECK_THROWS_AS(http::build_get("host", "health"), UsageError);  // no leading slash
+
+    // Header injection: a CR or LF ends the request line early, so the target
+    // receives something other than what was asked for and its complaint gets
+    // counted against the target.
+    CHECK_THROWS_AS(http::build_get("host\r\nX: y", "/"), UsageError);
+    CHECK_THROWS_AS(http::build_get("host", "/\r\nX: y"), UsageError);
+    CHECK_THROWS_AS(http::build_get("host", "/\npath"), UsageError);
+}
+
+TEST_CASE("status codes are read off the status line") {
+    CHECK(http::status_code(bytes_of("HTTP/1.1 200 OK\r\n\r\n")) == 200);
+    CHECK(http::status_code(bytes_of("HTTP/1.1 404 Not Found\r\n\r\n")) == 404);
+    CHECK(http::status_code(bytes_of("HTTP/1.1 503 Service Unavailable\r\n\r\n")) == 503);
+    CHECK(http::status_code(bytes_of("HTTP/1.0 200 OK\r\n\r\n")) == 200);
+    // The shortest thing that can carry a code, with no reason phrase.
+    CHECK(http::status_code(bytes_of("HTTP/1.1 204")) == 204);
+}
+
+TEST_CASE("too few bytes yields nothing rather than a guess") {
+    CHECK_FALSE(http::status_code(bytes_of("")).has_value());
+    CHECK_FALSE(http::status_code(bytes_of("HTTP/1.1 2")).has_value());
+    CHECK_FALSE(http::status_code(bytes_of("HTTP/1.1 20")).has_value());
+    // A partial code must not be read as a smaller one: "HTTP/1.1 20" is not 20.
+}
+
+TEST_CASE("bytes that are not HTTP yield nothing") {
+    CHECK_FALSE(http::status_code(bytes_of("PONGPONGPONG")).has_value());
+    CHECK_FALSE(http::status_code(bytes_of("HTTP/2.0 200 OK\r\n\r\n")).has_value());
+    CHECK_FALSE(http::status_code(bytes_of("HTTP/1.1 2xx OK\r\n")).has_value());
+    CHECK_FALSE(http::status_code(bytes_of("HTTP/1.1 2000 OK\r\n")).has_value());
+    // The caller separates "not yet" from "never" by whether the response is
+    // complete: complete plus nothing here is a protocol error, and decision 6
+    // counts that apart from a read failure.
+}
+
+TEST_CASE("the status line is found even with a body attached") {
+    const std::string full =
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    CHECK(http::status_code(bytes_of(full)) == 200);
 }

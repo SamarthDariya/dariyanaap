@@ -123,6 +123,7 @@ add_library(dariyanaap::stats ALIAS dariyanaap_stats)
 
 add_library(dariyanaap_load
   src/load/raw_echo.cpp
+  src/load/http.cpp
 )
 target_link_libraries(dariyanaap_load PUBLIC dariyanaap_stats)
 target_compile_options(dariyanaap_load PRIVATE ${DARIYANAAP_WARNINGS})
