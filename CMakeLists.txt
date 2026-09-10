@@ -43,12 +43,19 @@ option(DARIYANAAP_TSAN        "Build with ThreadSanitizer"  OFF)
 if(DARIYANAAP_ASAN AND DARIYANAAP_TSAN)
   message(FATAL_ERROR "DARIYANAAP_ASAN and DARIYANAAP_TSAN cannot both be enabled")
 endif()
+# Sanitizer builds keep assert() live. RelWithDebInfo — the default, and what
+# the measurement build uses — defines NDEBUG, which compiles every assert in
+# the repo away. That is right for a run whose numbers must not pay for
+# checks, and wrong for the builds whose entire job is finding bugs: the
+# asserts guarding "the caller mixed up two clocks" and "read_some on a
+# moved-from socket" were documentation rather than enforcement until this
+# existed. -UNDEBUG comes after the build-type flags, so it wins.
 if(DARIYANAAP_ASAN)
-  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g -UNDEBUG)
   add_link_options(-fsanitize=address,undefined)
 endif()
 if(DARIYANAAP_TSAN)
-  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g -UNDEBUG)
   add_link_options(-fsanitize=thread)
 endif()
 
@@ -107,7 +114,21 @@ target_link_libraries(dariyanaap_stats PUBLIC dariyanaap_core)
 target_compile_options(dariyanaap_stats PRIVATE ${DARIYANAAP_WARNINGS})
 add_library(dariyanaap::stats ALIAS dariyanaap_stats)
 
-# M2 adds dariyanaap_load, M4 dariyanaap_fault.
+# ---------------------------------------------------------------------------
+# Library: load
+# ---------------------------------------------------------------------------
+#
+# The driver: protocols and the runners. Depends on stats, because a runner
+# records into a Histogram, and transitively on core for sockets.
+
+add_library(dariyanaap_load
+  src/load/raw_echo.cpp
+)
+target_link_libraries(dariyanaap_load PUBLIC dariyanaap_stats)
+target_compile_options(dariyanaap_load PRIVATE ${DARIYANAAP_WARNINGS})
+add_library(dariyanaap::load ALIAS dariyanaap_load)
+
+# M4 adds dariyanaap_fault.
 # Each gets its own block here, and the layering is enforced by the build:
 # if core ever includes from load, it will not link.
 
@@ -155,9 +176,9 @@ if(DARIYANAAP_BUILD_TESTS)
 
   enable_testing()
 
-  foreach(suite core_tests stats_tests)
+  foreach(suite core_tests stats_tests load_tests)
     add_executable(${suite} tests/${suite}.cpp)
-    target_link_libraries(${suite} PRIVATE dariyanaap_stats doctest::doctest)
+    target_link_libraries(${suite} PRIVATE dariyanaap_load doctest::doctest)
     target_include_directories(${suite} PRIVATE tests)
     target_compile_options(${suite} PRIVATE ${DARIYANAAP_WARNINGS})
     add_test(NAME ${suite} COMMAND ${suite})
