@@ -805,3 +805,75 @@ TEST_CASE("write_all loops over partial writes for more than a buffer's worth") 
     CHECK(received == kSize);
     ::close(server);
 }
+
+// ---------------------------------------------------------------------------
+// SocketAddress::with_port and Socket::adopt
+// ---------------------------------------------------------------------------
+
+TEST_CASE("with_port replaces the port and leaves the host alone") {
+    const SocketAddress v4 = resolve(Endpoint("127.0.0.1", 8080))[0];
+    CHECK(v4.with_port(9092).str() == "127.0.0.1:9092");
+    CHECK(v4.with_port(1).str() == "127.0.0.1:1");
+    CHECK(v4.with_port(65535).str() == "127.0.0.1:65535");
+    CHECK(v4.str() == "127.0.0.1:8080");  // the original is untouched
+
+    const SocketAddress v6 = resolve(Endpoint("::1", 8080))[0];
+    CHECK(v6.with_port(9092).str() == "[::1]:9092");
+    CHECK(v6.with_port(9092).family() == AF_INET6);
+}
+
+TEST_CASE("with_port accepts zero, which is the whole reason it exists") {
+    // Endpoint refuses port 0 because it models a destination. A bind address
+    // is a different thing, and 0 there means "kernel, choose one".
+    const SocketAddress v4 = resolve(Endpoint("127.0.0.1", 8080))[0];
+    CHECK(v4.with_port(0).str() == "127.0.0.1:0");
+
+    CHECK_THROWS_AS(Endpoint("127.0.0.1", 0), InvalidEndpoint);  // still refused there
+}
+
+TEST_CASE("the constructor refuses a bracketed host, which parse would have stripped") {
+    // Caught while writing the with_port tests: Endpoint("[::1]", 8080) put the
+    // brackets in the hostname, str() re-bracketed it, and resolve() reported
+    // "cannot resolve [[::1]]:8080". The mistake belongs at construction.
+    CHECK_THROWS_AS((Endpoint("[::1]", 8080)), InvalidEndpoint);
+    CHECK_THROWS_AS((Endpoint("[::1", 8080)), InvalidEndpoint);
+    CHECK_THROWS_AS((Endpoint("::1]", 8080)), InvalidEndpoint);
+
+    // The right spellings both work and agree.
+    CHECK(Endpoint("::1", 8080) == Endpoint::parse("[::1]:8080"));
+}
+
+TEST_CASE("adopt suppresses SIGPIPE on a descriptor it did not create") {
+    // SO_NOSIGPIPE is per-socket and is not inherited across accept(), so the
+    // server half of any connection needs it set explicitly.
+    const auto [a, b] = connected_pair();
+    const Socket adopted = Socket::adopt(a);
+
+    int value = 0;
+    socklen_t size = sizeof(value);
+    REQUIRE(::getsockopt(adopted.fd(), SOL_SOCKET, SO_NOSIGPIPE, &value, &size) == 0);
+    CHECK(value != 0);
+    ::close(b);
+}
+
+TEST_CASE("an adopted socket survives writing to a peer that has gone") {
+    // The behaviour the option buys, not just the option being set. Without
+    // it this test does not fail — the process is killed by signal 13.
+    const auto [a, b] = connected_pair();
+    Socket adopted = Socket::adopt(a);
+    ::close(b);
+
+    const std::string data = "REQUEST";
+    bool threw = false;
+    for (int attempt = 0; attempt < 5 && !threw; ++attempt) {
+        try {
+            adopted.write_all(std::span<const char>(data.data(), data.size()));
+        } catch (const IoError&) {
+            threw = true;
+        }
+        if (!threw) {
+            std::this_thread::sleep_for(Millis(20));
+        }
+    }
+    CHECK(threw);
+}

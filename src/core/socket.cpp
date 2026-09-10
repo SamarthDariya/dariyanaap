@@ -118,6 +118,12 @@ void set_nonblocking(int fd, bool on) {
 
 }  // namespace
 
+Socket Socket::adopt(int fd) {
+    Socket socket(fd);
+    disable_sigpipe(fd);
+    return socket;
+}
+
 Socket Socket::connect(const SocketAddress& address, Millis timeout) {
     const int fd = ::socket(address.family(), SOCK_STREAM, 0);
     if (fd < 0) {
@@ -128,9 +134,8 @@ Socket Socket::connect(const SocketAddress& address, Millis timeout) {
     // descriptor on the way out, which is the entire reason chunk 2.1 exists —
     // a run that reconnects on error would otherwise leak an fd per failure
     // and start reporting fd exhaustion as target failures.
-    Socket socket(fd);
+    Socket socket = adopt(fd);
 
-    disable_sigpipe(fd);
     set_nonblocking(fd, true);
 
     if (::connect(fd, address.addr(), address.size()) != 0) {

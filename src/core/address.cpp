@@ -1,6 +1,7 @@
 #include "core/address.hpp"
 
 #include <netdb.h>
+#include <netinet/in.h>
 
 #include <cstring>
 
@@ -20,6 +21,23 @@ const sockaddr* SocketAddress::addr() const {
 
 int SocketAddress::family() const {
     return storage_.ss_family;
+}
+
+SocketAddress SocketAddress::with_port(uint16_t port) const {
+    SocketAddress copy = *this;
+    switch (copy.storage_.ss_family) {
+        case AF_INET:
+            reinterpret_cast<sockaddr_in*>(&copy.storage_)->sin_port = htons(port);
+            return copy;
+        case AF_INET6:
+            reinterpret_cast<sockaddr_in6*>(&copy.storage_)->sin6_port = htons(port);
+            return copy;
+        default:
+            // resolve() only ever produces these two, so reaching here means a
+            // SocketAddress was built from somewhere else.
+            throw IoError("cannot set a port on address family " +
+                          to_string(copy.storage_.ss_family));
+    }
 }
 
 string SocketAddress::str() const {

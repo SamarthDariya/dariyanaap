@@ -2,6 +2,7 @@
 
 #include <sys/socket.h>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -21,6 +22,16 @@ public:
     const sockaddr* addr() const;
     socklen_t size() const { return size_; }
     int family() const;
+
+    // The same host with a different port.
+    //
+    // Exists because Endpoint refuses port 0 (chunk 0.8) and is right to: as a
+    // destination, port 0 is meaningless. As a BIND address it means "kernel,
+    // choose one", which is how a listener avoids colliding with whatever else
+    // is on the machine. Rather than weaken Endpoint's invariant for a case it
+    // does not model, the port is replaced here, where the family-specific
+    // reach into sockaddr can be written once instead of in every caller.
+    SocketAddress with_port(std::uint16_t port) const;
 
     // Numeric host and port, never a reverse lookup. Goes into error messages
     // and the CSV header, and a reverse DNS round trip inside a failure path

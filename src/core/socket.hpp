@@ -29,6 +29,16 @@ public:
     // check the syscall's return value, which is a bug, not a runtime error.
     explicit Socket(int fd);
 
+    // Take ownership of a descriptor and apply the options every socket this
+    // repo owns must have — currently just SIGPIPE suppression.
+    //
+    // Both connect() and Listener::accept() go through here, because
+    // SO_NOSIGPIPE is per-socket and is NOT inherited by an accepted
+    // descriptor. A server that set it only on its listener would die of
+    // SIGPIPE the first time a client hung up mid-response, which is exactly
+    // what a load generator does to a target at the end of every run.
+    static Socket adopt(int fd);
+
     // Connect to one already-resolved address, giving up after `timeout`.
     //
     // Non-blocking connect plus poll, not a blocking connect, and the reason

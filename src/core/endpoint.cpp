@@ -44,6 +44,15 @@ Endpoint::Endpoint(string host, uint16_t port) : host_(std::move(host)), port_(p
     if (host_.empty()) {
         throw InvalidEndpoint("endpoint host must not be empty");
     }
+    if (host_.find('[') != string::npos || host_.find(']') != string::npos) {
+        // parse() strips brackets and str() puts them back, so a host that
+        // still contains one came from a caller who passed the textual form to
+        // the constructor instead of to parse(). Left unchecked it produces
+        // "[[::1]]:8080", which resolves to nothing — and the failure surfaces
+        // at connect time as an unresolvable host rather than here.
+        throw InvalidEndpoint("endpoint host must not contain brackets, got \"" +
+                              host_ + "\" — use Endpoint::parse for \"[::1]:8080\" form");
+    }
     if (port_ == 0) {
         // Port 0 means "let the kernel pick" when binding, and means nothing
         // at all as a destination. Refusing it here turns a run that would
