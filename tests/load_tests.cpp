@@ -12,6 +12,7 @@
 #include "load/http.hpp"
 #include "load/http11_get.hpp"
 #include "load/raw_echo.hpp"
+#include "load/run_result.hpp"
 
 using namespace dariyanaap;
 
@@ -430,4 +431,118 @@ TEST_CASE("Http11Get is usable through the Protocol interface, like the runner w
     CHECK(protocol.request().size() > 0);
     CHECK(protocol.consume(bytes_of(full)) == ResponseState::Complete);
     CHECK(protocol.succeeded(bytes_of(full)));
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 2.8 — ErrorCounts and RunResult
+// ---------------------------------------------------------------------------
+
+// Declared here as well as in stats_tests.cpp. Duplicated deliberately: the
+// two suites link different libraries, and a shared test header for one
+// three-line concept would be more machinery than the duplication costs.
+template <class T>
+concept HasErrorRate = requires(const T& t) { t.error_rate(); };
+
+TEST_CASE("the six failure kinds are separate counters, not one rate") {
+    // Decision 6. Enforced the same way the absent mean is: a static_assert,
+    // because a comment would not stop anyone adding a convenience accessor.
+    static_assert(!HasErrorRate<ErrorCounts>,
+                  "DESIGN.md decision 6: never one error rate");
+    static_assert(!HasErrorRate<RunResult>);
+
+    ErrorCounts counts;
+    CHECK(counts.total() == 0);
+
+    counts.connect = 1;
+    counts.write = 2;
+    counts.read = 4;
+    counts.timeout = 8;
+    counts.protocol = 16;
+    counts.rejected = 32;
+    CHECK(counts.total() == 63);  // distinct powers of two: nothing aliases
+}
+
+TEST_CASE("merging error counts sums each kind independently") {
+    ErrorCounts a;
+    a.connect = 3;
+    a.timeout = 5;
+
+    ErrorCounts b;
+    b.timeout = 7;
+    b.rejected = 11;
+
+    a.merge(b);
+    CHECK(a.connect == 3);
+    CHECK(a.timeout == 12);
+    CHECK(a.rejected == 11);
+    CHECK(a.write == 0);
+    CHECK(a.total() == 26);
+}
+
+TEST_CASE("a run where every connect was refused has counts and no distribution") {
+    // The case M1's optional<Summary> was built for. Reporting p99 = 0 here
+    // would be the most flattering possible under-report.
+    RunResult result;
+    result.attempted = 500;
+    result.errors.connect = 500;
+    result.duration = Secs(10);
+
+    CHECK_FALSE(result.latency.has_value());
+    CHECK(result.timed() == 0);
+    CHECK(result.untimed() == 500);
+    CHECK(result.consistent());
+}
+
+TEST_CASE("timeouts and non-2xx replies are in the histogram, so not untimed") {
+    // Timeouts because leaving them out is coordinated omission: the slowest
+    // requests of the run would be the only ones missing. Non-2xx because
+    // latency is a property of time, not of semantics — and unit 9 needs a
+    // tripped breaker's fast failures to show up in the caller's p99.
+    Histogram histogram;
+    for (int i = 0; i < 90; ++i) histogram.record(Micros(100));   // successes
+    for (int i = 0; i < 7; ++i) histogram.record(Micros(50));     // fast 503s
+    for (int i = 0; i < 3; ++i) histogram.record(Secs(1));        // timeouts
+
+    RunResult result;
+    result.attempted = 105;
+    result.errors.timeout = 3;
+    result.errors.rejected = 7;
+    result.errors.connect = 5;   // these five never got a connection
+    result.latency = Summary::of(histogram, Secs(2));
+    result.duration = Secs(2);
+
+    CHECK(result.timed() == 100);
+    CHECK(result.untimed() == 5);       // timeout and rejected are NOT counted here
+    CHECK(result.consistent());
+    CHECK(result.errors.total() == 15);  // but they are still errors
+}
+
+TEST_CASE("a request that vanished is caught by the accounting") {
+    // The runner increments these from several places. A request counted as
+    // attempted but landing in neither the histogram nor an untimed error is a
+    // request that disappeared, and a rig that loses requests silently reports
+    // a throughput it never achieved.
+    Histogram histogram;
+    histogram.record(Micros(10));
+
+    RunResult result;
+    result.attempted = 10;
+    result.latency = Summary::of(histogram, Secs(1));
+    result.errors.connect = 2;
+    result.duration = Secs(1);
+
+    CHECK(result.timed() == 1);
+    CHECK(result.untimed() == 2);
+    CHECK_FALSE(result.consistent());   // 10 != 1 + 2
+
+    result.attempted = 3;
+    CHECK(result.consistent());
+}
+
+TEST_CASE("an empty run is consistent, rather than a special case") {
+    const RunResult result;
+    CHECK(result.attempted == 0);
+    CHECK(result.consistent());
+    CHECK(result.errors.total() == 0);
+    CHECK_FALSE(result.latency.has_value());
 }
