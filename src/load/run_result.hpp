@@ -58,8 +58,14 @@ struct ErrorCounts {
 // no request latency at all, and a protocol error's duration measures how long
 // the target took to say something unintelligible.
 struct RunResult {
-    // Requests the runner started. Counted directly rather than derived,
-    // because the derivation is subtle enough to get wrong quietly.
+    // Attempts to complete one request, INCLUDING those that failed before a
+    // request could be sent — a refused connect is a failed attempt, not a
+    // non-event. Counted directly rather than derived, because the derivation
+    // is subtle enough to get wrong quietly.
+    //
+    // Excludes anything that happened during warm-up. Warm-up requests are not
+    // partially excluded: if they counted as attempts but were kept out of the
+    // histogram, consistent() would report every run as having lost requests.
     std::uint64_t attempted = 0;
 
     ErrorCounts errors;

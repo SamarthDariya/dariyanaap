@@ -1,6 +1,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <atomic>
+#include <optional>
 #include <functional>
 #include <span>
 #include <string>
@@ -15,6 +17,7 @@
 #include "load/http11_get.hpp"
 #include "load/raw_echo.hpp"
 #include "load/run_result.hpp"
+#include "load/worker.hpp"
 
 using namespace dariyanaap;
 
@@ -738,4 +741,210 @@ TEST_CASE("perform_request never throws, whatever the target does") {
     std::vector<char> read_buffer(64);
     std::vector<char> received;
     CHECK_NOTHROW(perform_request(client, protocol, read_buffer, received));
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 2.9b — ConnectionWorker
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A target that echoes on every connection it accepts, concurrently.
+//
+// One thread per connection, because a single-threaded accept-then-serve loop
+// serves exactly one client and leaves the rest sitting in the backlog — which
+// is how the first version of this harness made a healthy worker look like it
+// had done one request in 300ms.
+class EchoTarget {
+public:
+    explicit EchoTarget(std::size_t payload)
+        : listener_(Listener::bind_ephemeral("127.0.0.1")) {
+        acceptor_ = std::thread([this, payload] {
+            for (;;) {
+                std::optional<Socket> served;
+                try {
+                    served = listener_.accept();
+                } catch (const IoError&) {
+                    return;
+                }
+                if (stopping_.load(std::memory_order_relaxed)) {
+                    return;  // the destructor's poke, not a real client
+                }
+                connections_.emplace_back(
+                    [served = std::move(*served), payload]() mutable {
+                        serve(served, payload);
+                    });
+            }
+        });
+    }
+
+    ~EchoTarget() {
+        stopping_.store(true, std::memory_order_relaxed);
+        try {  // unblock the accept
+            const Socket poke = Socket::connect_any(
+                resolve(Endpoint("127.0.0.1", listener_.port())), Millis(500));
+        } catch (const IoError&) {}
+        if (acceptor_.joinable()) acceptor_.join();
+        for (std::thread& connection : connections_) {
+            if (connection.joinable()) connection.join();
+        }
+    }
+
+    std::uint16_t port() const { return listener_.port(); }
+
+private:
+    // Echo `payload` bytes at a time until the client goes away. Returns
+    // rather than throwing, so one client hanging up does not take the target
+    // down with it.
+    static void serve(Socket& served, std::size_t payload) {
+        std::vector<char> buffer(64 * 1024);
+        try {
+            for (;;) {
+                std::size_t total = 0;
+                while (total < payload) {
+                    const std::size_t got = served.read_some(
+                        std::span<char>(buffer.data(), buffer.size()));
+                    if (got == 0) return;  // client closed; this connection is done
+                    total += got;
+                }
+                served.write_all(std::span<const char>(buffer.data(), payload));
+            }
+        } catch (const IoError&) {
+            // The client vanished mid-exchange. Not the target's problem.
+        }
+    }
+
+    Listener listener_;
+    std::atomic<bool> stopping_{false};
+    std::thread acceptor_;
+    std::vector<std::thread> connections_;
+};
+
+std::uint16_t dead_port() {
+    const Listener probe = Listener::bind_ephemeral("127.0.0.1");
+    return probe.port();  // closed when this returns
+}
+
+}  // namespace
+
+TEST_CASE("a worker drives a healthy target and accounts for every attempt") {
+    const RawEcho protocol(64);
+    EchoTarget target(64);
+
+    ConnectionWorker worker(protocol, resolve(Endpoint("127.0.0.1", target.port())),
+                            WorkerConfig{});
+    const MonotonicClock::Instant start = MonotonicClock::now();
+    worker.run(start, start + Millis(300));
+
+    CHECK(worker.attempted() > 0);
+    CHECK(worker.connections_opened() == 1);   // nothing killed the connection
+    CHECK(worker.errors().total() == 0);
+    CHECK(worker.histogram().count() == worker.attempted());
+
+    RunResult result;
+    result.attempted = worker.attempted();
+    result.errors = worker.errors();
+    result.latency = Summary::of(worker.histogram(), Millis(300));
+    CHECK(result.consistent());
+}
+
+TEST_CASE("a refused target is counted, and the delay stops it becoming a spin") {
+    // Without reconnect_delay a refused connect returns in microseconds and
+    // this loop would run millions of times in 300ms, burning a core and
+    // inflating the connect counter into noise.
+    const RawEcho protocol(16);
+    WorkerConfig config;
+    config.reconnect_delay = Millis(50);
+
+    ConnectionWorker worker(protocol, resolve(Endpoint("127.0.0.1", dead_port())), config);
+    const MonotonicClock::Instant start = MonotonicClock::now();
+    worker.run(start, start + Millis(300));
+
+    CHECK(worker.errors().connect > 0);
+    CHECK(worker.connections_opened() == 0);
+    CHECK(worker.histogram().count() == 0);
+    // ~300ms / 50ms is about 6 attempts. Generous bound, but orders of
+    // magnitude below what a spin would produce.
+    CHECK(worker.attempted() < 50);
+    CHECK(worker.attempted() == worker.errors().connect);
+}
+
+TEST_CASE("nothing that starts during warm-up is counted anywhere") {
+    // Warm-up has to mean one thing. If these requests counted as attempts but
+    // stayed out of the histogram, consistent() would report every run as
+    // having lost requests.
+    const RawEcho protocol(64);
+    EchoTarget target(64);
+
+    ConnectionWorker worker(protocol, resolve(Endpoint("127.0.0.1", target.port())),
+                            WorkerConfig{});
+    const MonotonicClock::Instant start = MonotonicClock::now();
+    // Warm up for the whole run: measure from the deadline, so nothing counts.
+    worker.run(start + Millis(300), start + Millis(300));
+
+    CHECK(worker.attempted() == 0);
+    CHECK(worker.errors().total() == 0);
+    CHECK(worker.histogram().count() == 0);
+    // But work really happened — the connection was opened and used.
+    CHECK(worker.connections_opened() >= 1);
+}
+
+TEST_CASE("a warm-up window shorter than the run measures only the tail") {
+    const RawEcho protocol(64);
+    EchoTarget target(64);
+
+    ConnectionWorker warm(protocol, resolve(Endpoint("127.0.0.1", target.port())),
+                          WorkerConfig{});
+    const MonotonicClock::Instant start = MonotonicClock::now();
+    warm.run(start + Millis(150), start + Millis(300));
+
+    ConnectionWorker cold(protocol, resolve(Endpoint("127.0.0.1", target.port())),
+                          WorkerConfig{});
+    const MonotonicClock::Instant second = MonotonicClock::now();
+    cold.run(second, second + Millis(300));
+
+    // Half the window measured, so roughly half the attempts — a loose bound,
+    // because the point is that warm-up excludes rather than that it is exact.
+    CHECK(warm.attempted() > 0);
+    CHECK(warm.attempted() < cold.attempted());
+}
+
+TEST_CASE("a target that times out churns connections rather than reusing a bad one") {
+    // A timed-out connection may still deliver its reply later, so reusing it
+    // would report reply N against request N+1. The worker drops it and opens
+    // another, and connections_opened() makes that visible.
+    const RawEcho protocol(16);
+    Listener listener = Listener::bind_ephemeral("127.0.0.1");
+    std::atomic<bool> stop{false};
+    std::thread silent([&listener, &stop] {
+        std::vector<Socket> held;
+        while (!stop.load(std::memory_order_relaxed)) {
+            try {
+                held.push_back(listener.accept());   // accept and never reply
+            } catch (const IoError&) { return; }
+            if (held.size() > 64) held.clear();
+        }
+    });
+
+    WorkerConfig config;
+    config.read_timeout = Millis(60);
+    config.reconnect_delay = Millis(1);
+    ConnectionWorker worker(protocol, resolve(Endpoint("127.0.0.1", listener.port())),
+                            config);
+    const MonotonicClock::Instant start = MonotonicClock::now();
+    worker.run(start, start + Millis(400));
+
+    CHECK(worker.errors().timeout > 1);
+    CHECK(worker.connections_opened() > 1);        // it did not reuse a dead one
+    CHECK(worker.connections_opened() >= worker.errors().timeout);
+    // Timeouts are in the histogram, at their real elapsed time.
+    CHECK(worker.histogram().count() == worker.errors().timeout);
+    CHECK(worker.histogram().max() >= Millis(60));
+
+    stop.store(true, std::memory_order_relaxed);
+    try {
+        const Socket poke = Socket::connect_any(
+            resolve(Endpoint("127.0.0.1", listener.port())), Millis(500));
+    } catch (const IoError&) {}
+    silent.join();
 }
