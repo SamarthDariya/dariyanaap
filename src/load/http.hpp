@@ -4,6 +4,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 
 namespace dariyanaap::http {
 
@@ -41,5 +42,27 @@ std::string build_get(const std::string& host, const std::string& path);
 // plus nullopt means the target is not speaking HTTP, which decision 6 counts
 // as a protocol error rather than a read failure.
 std::optional<int> status_code(std::span<const char> response);
+
+// One header's value, or nullopt if absent.
+//
+// `headers` is everything before the blank line, status line included. Names
+// are matched case-insensitively, because RFC 9110 says they are and real
+// servers disagree about spelling — nginx sends "Content-Length", some
+// frameworks send "content-length", and a rig that only matched one would
+// report a perfectly framed response as unparseable.
+//
+// The returned view points into `headers`, so it lives only as long as the
+// buffer does. That is fine on the read path, where the buffer outlives the
+// parse, and it keeps this allocation-free.
+std::optional<std::string_view> header_value(std::string_view headers,
+                                             std::string_view name);
+
+// The declared body length, or nullopt if the header is absent or is not a
+// plain decimal count.
+//
+// A present-but-unparseable Content-Length is deliberately indistinguishable
+// from an absent one here: both mean the body cannot be framed, and the caller
+// treats an unframeable response as a protocol error either way.
+std::optional<std::uint64_t> content_length(std::string_view headers);
 
 }  // namespace dariyanaap::http

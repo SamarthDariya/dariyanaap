@@ -70,4 +70,81 @@ optional<int> status_code(span<const char> response) {
     return code;
 }
 
+namespace {
+
+bool equal_ignoring_case(string_view a, string_view b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        // Only ASCII letters differ by this bit, and header names are ASCII.
+        // tolower() would drag in the locale, which can make "I" lowercase to
+        // a dotless i in a Turkish locale and break header matching.
+        const char left = (a[i] >= 'A' && a[i] <= 'Z') ? static_cast<char>(a[i] + 32) : a[i];
+        const char right = (b[i] >= 'A' && b[i] <= 'Z') ? static_cast<char>(b[i] + 32) : b[i];
+        if (left != right) {
+            return false;
+        }
+    }
+    return true;
+}
+
+string_view trim(string_view value) {
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+        value.remove_prefix(1);
+    }
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+        value.remove_suffix(1);
+    }
+    return value;
+}
+
+}  // namespace
+
+optional<string_view> header_value(string_view headers, string_view name) {
+    // Walk lines rather than searching for "name:" anywhere: a substring
+    // search would match "X-Not-Content-Length" and would also match text
+    // inside another header's value.
+    size_t line_begins = headers.find("\r\n");
+    if (line_begins == string_view::npos) {
+        return nullopt;  // status line only, no headers
+    }
+    line_begins += 2;
+
+    while (line_begins < headers.size()) {
+        size_t line_ends = headers.find("\r\n", line_begins);
+        if (line_ends == string_view::npos) {
+            line_ends = headers.size();
+        }
+        const string_view line = headers.substr(line_begins, line_ends - line_begins);
+        const size_t colon = line.find(':');
+        if (colon != string_view::npos &&
+            equal_ignoring_case(line.substr(0, colon), name)) {
+            return trim(line.substr(colon + 1));
+        }
+        line_begins = line_ends + 2;
+    }
+    return nullopt;
+}
+
+optional<uint64_t> content_length(string_view headers) {
+    const optional<string_view> value = header_value(headers, "content-length");
+    if (!value || value->empty()) {
+        return nullopt;
+    }
+    uint64_t length = 0;
+    for (const char digit : *value) {
+        if (digit < '0' || digit > '9') {
+            // No signs, no whitespace inside, no hex. A Content-Length we
+            // cannot read is a body we cannot frame.
+            return nullopt;
+        }
+        if (length > (UINT64_MAX - static_cast<uint64_t>(digit - '0')) / 10) {
+            return nullopt;  // would overflow; not a real body length
+        }
+        length = length * 10 + static_cast<uint64_t>(digit - '0');
+    }
+    return length;
+}
+
 }  // namespace dariyanaap::http

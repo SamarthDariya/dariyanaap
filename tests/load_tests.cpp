@@ -199,3 +199,85 @@ TEST_CASE("the status line is found even with a body attached") {
         "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
     CHECK(http::status_code(bytes_of(full)) == 200);
 }
+
+// ---------------------------------------------------------------------------
+// Chunk 2.7a — http::header_value and http::content_length
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Everything before the blank line, status line included.
+constexpr std::string_view kHeaders =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.25.3\r\n"
+    "Content-Length: 1234\r\n"
+    "Content-Type: text/plain; charset=utf-8\r\n"
+    "X-Not-Content-Length: 9\r\n"
+    "Empty:";
+
+}  // namespace
+
+TEST_CASE("a header is found by name and its value trimmed") {
+    CHECK(http::header_value(kHeaders, "Content-Length") == "1234");
+    CHECK(http::header_value(kHeaders, "Server") == "nginx/1.25.3");
+    CHECK(http::header_value(kHeaders, "Content-Type") == "text/plain; charset=utf-8");
+}
+
+TEST_CASE("header names match case-insensitively, as the RFC requires") {
+    // nginx sends "Content-Length", some frameworks send "content-length". A
+    // rig that matched one spelling would report a well-framed response as
+    // unparseable and count it as a protocol error.
+    CHECK(http::header_value(kHeaders, "content-length") == "1234");
+    CHECK(http::header_value(kHeaders, "CONTENT-LENGTH") == "1234");
+    CHECK(http::header_value(kHeaders, "cOnTeNt-LeNgTh") == "1234");
+}
+
+TEST_CASE("a similar header name is not mistaken for the one asked for") {
+    // A substring search for "Content-Length:" would have matched
+    // "X-Not-Content-Length: 9" and framed the body at 9 bytes.
+    CHECK(http::header_value(kHeaders, "Content-Length") == "1234");
+    CHECK(http::header_value(kHeaders, "Not-Content-Length") == std::nullopt);
+    CHECK(http::header_value(kHeaders, "Length") == std::nullopt);
+    CHECK(http::header_value(kHeaders, "X-Not-Content-Length") == "9");
+}
+
+TEST_CASE("an absent header, an empty value, and no headers at all") {
+    CHECK(http::header_value(kHeaders, "Transfer-Encoding") == std::nullopt);
+    CHECK(http::header_value(kHeaders, "Empty") == "");
+    // Status line only: there are no headers to walk.
+    CHECK(http::header_value("HTTP/1.1 204 No Content", "Content-Length") == std::nullopt);
+}
+
+TEST_CASE("the status line is never matched as a header") {
+    // It has no colon before a space, but it does contain "HTTP/1.1", and a
+    // naive line loop that did not skip it could still match something.
+    CHECK(http::header_value("HTTP/1.1 200 OK\r\nA: b", "HTTP/1.1 200 OK") == std::nullopt);
+    CHECK(http::header_value("HTTP/1.1 200 OK\r\nA: b", "A") == "b");
+}
+
+TEST_CASE("content length reads a plain decimal count") {
+    CHECK(http::content_length(kHeaders) == 1234u);
+    CHECK(http::content_length("HTTP/1.1 200 OK\r\nContent-Length: 0") == 0u);
+    CHECK(http::content_length("HTTP/1.1 200 OK\r\nContent-Length:   42  ") == 42u);
+}
+
+TEST_CASE("a content length that cannot be read is the same as absent") {
+    // Both mean the body cannot be framed, and the caller treats an
+    // unframeable response as a protocol error either way.
+    CHECK(http::content_length("HTTP/1.1 200 OK\r\nServer: x") == std::nullopt);
+    CHECK(http::content_length("HTTP/1.1 200 OK\r\nContent-Length:") == std::nullopt);
+    CHECK(http::content_length("HTTP/1.1 200 OK\r\nContent-Length: abc") == std::nullopt);
+    CHECK(http::content_length("HTTP/1.1 200 OK\r\nContent-Length: +5") == std::nullopt);
+    CHECK(http::content_length("HTTP/1.1 200 OK\r\nContent-Length: -5") == std::nullopt);
+    CHECK(http::content_length("HTTP/1.1 200 OK\r\nContent-Length: 1 2") == std::nullopt);
+    CHECK(http::content_length("HTTP/1.1 200 OK\r\nContent-Length: 0x10") == std::nullopt);
+}
+
+TEST_CASE("a content length too large to be a body is refused, not wrapped") {
+    // 20 nines overflows uint64. Wrapping would produce a small length, frame
+    // the response early, and desynchronise every request after it.
+    CHECK(http::content_length(
+              "HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999") == std::nullopt);
+    CHECK(http::content_length(
+              "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615") == 18446744073709551615ull);
+}
