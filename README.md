@@ -53,7 +53,7 @@ Full reasoning, with the rejected alternatives, in **[DESIGN.md](DESIGN.md)**.
 
 ## Status
 
-**Design: drafted.** **Implementation: M0–M3 complete, M4 next.**
+**Design: drafted.** **Implementation: M0–M4 complete, M5 next.**
 
 | Milestone | What lands | Effort | Status |
 |---|---|---|---|
@@ -61,8 +61,8 @@ Full reasoning, with the rejected alternatives, in **[DESIGN.md](DESIGN.md)**.
 | M1 — Histogram | HDR buckets, percentiles, merge, CSV | 0.5d | ✅ |
 | M2 — Closed-loop driver | thread-per-conn, HTTP + raw TCP, **self-calibration** | 1d | ✅ |
 | M3 — Open-loop driver | intended-send-time, **coordinated omission demo** | 1d | ✅ |
-| M4 — Fault injection | the four primitives + a runtime control channel | 0.5d | 🔸 next |
-| M5 — Output | CSV schema, plot script, submodule smoke test | 0.5d | ⬜ |
+| M4 — Fault injection | the four primitives + a runtime control channel | 0.5d | ✅ |
+| M5 — Output | CSV schema, plot script, submodule smoke test | 0.5d | 🔸 next |
 
 ~4 days. The track's estimate is 2–3; if it needs to be 2, cut M4's control channel to environment
 variables read at startup and skip the per-second timeseries in M5.
@@ -141,18 +141,23 @@ E3 is the one that matters and gets predicted first.
       closed-loop *also* overstates throughput by 26%. Prediction was wrong by 11×, by reasoning
       about a mean. See `BREAK.md`.
 
-### M4 — Fault injection 🔸
-- [ ] `fault::inject_latency(ms, jitter)` — sleep before responding, jitter to avoid lockstep
-- [ ] `fault::drop_probability(p)` — drop the response, or the connection, and say which
-- [ ] `fault::partition(node_a, node_b)` — symmetric message drop between two named peers (unit 8)
-- [ ] `fault::hang_forever()` — accept and never reply, the failure mode worse than being down
-- [ ] knobs readable at startup from env, **and settable mid-run** over a tiny control socket —
-      units 2, 8 and 9 all need to flip a knob without restarting the target
-- [ ] disabled fault checks cost one relaxed atomic load, verified by benchmark, so a target can ship
-      them in the hot path without apology
-- [ ] **verifier:** with all faults off, target throughput is within noise of an unlinked build
+### M4 — Fault injection ✅
+- [x] `set_latency(mean, jitter)` — jitter refused past the mean, since the draw would go negative
+      and clamping it would mean the configured mean was not the mean
+- [x] `set_drop_probability(p)` — the caller decides what dropping *means* (close the connection, or
+      answer nothing), because which it picks matters and the library should not choose
+- [x] `partition(a, b)` — symmetric, stored name-ordered; a node with no identity blocks nothing,
+      which is safer than guessing
+- [x] `set_hang_forever` — checked in a loop, so healing takes effect at once and unit 2 can stage a
+      mid-run restart. The name describes the failure, not a promise about the process
+- [x] env at startup **and** a line-oriented control socket for mid-run changes (decision 10)
+- [x] one relaxed load of a single bool gates every check; `blocked()` takes two gates so the
+      partition mutex is never reached on a healthy cluster
+- [x] **E4 done: +2.66 ns per request** with everything off — about one thousandth of the rig's own
+      51.7 µs p99 floor. Decision 9 holds, so a target can call these unconditionally
+- [x] 4 suites green under ASan/UBSan and TSan, including six threads reading knobs while they change
 
-### M5 — Output and ergonomics ⬜
+### M5 — Output and ergonomics 🔸
 - [ ] CSV schema: `summary.csv`, `histogram.csv`, optional `timeseries.csv` (per-second p99)
 - [ ] every file stamped with rig version, target, mode, offered rate, duration, and rig ceiling
 - [ ] `tools/plot.py` — throwaway matplotlib; latency CDF and per-second p99. Not a product.

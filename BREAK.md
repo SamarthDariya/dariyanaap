@@ -305,5 +305,8 @@ Numbers established here that later units quote rather than re-derive:
 | Histogram p999 error bound | 0.5434% measured — the worst of any percentile | E1 |
 | `record()` cost | 2.3 ns/op warm (3.0 ns cold) | E1 |
 | Histogram memory | 30,488 bytes, independent of sample count | E1 |
+| Disabled fault check | **+2.66 ns** per request, everything off | E4 |
+| Coordinated omission, p99 ratio | **504×** closed-loop vs open-loop, same target | E3 |
+| Closed-loop throughput overstatement | **26%** — reports 100,641 rps where 80,000 is sustainable | E3 |
 | Clock resolution (warm) | **42 ns** — one tick of the 24 MHz timebase | M0 |
 | Clock resolution (cold) | 90 ns — an artifact of CPU frequency scaling, not granularity | M0 |
