@@ -154,7 +154,32 @@ load, two modes. Then, mid-run, stall the target for 200ms with `fault::hang_for
 | max | | |
 | requests issued | | |
 
-- **Predicted:** the p99 ratio open/closed is about ___× · p999 ratio about ___×
+- **Predicted (by Claude, before the run, committed ahead of the code that measures it —
+  Samarth's own prediction slot is below and still his to fill):**
+
+  Offered load 40,000 rps, 32 connections, against a target stalled for 200ms once per second.
+
+  | | closed-loop | open-loop |
+  |---|---|---|
+  | throughput | ~39,000 | ~39,000 |
+  | p50 | ~250 µs | ~300 µs |
+  | p99 | ~2 ms | ~90 ms |
+  | p999 | ~5 ms | ~180 ms |
+  | requests issued | ~117,000 | ~120,000 |
+
+  Reasoning: each 200ms stall blocks all 32 connections. Closed-loop simply stops sending, so it
+  records 32 requests at ~200ms each and nothing else — about 0.05% of a 3-second run, which lands
+  at p999 and leaves p99 almost untouched. Open-loop keeps the schedule running, so the ~8,000
+  requests due during each stall all accrue latency from their intended send time, with the earliest
+  waiting nearly the full 200ms. Three stalls in three seconds is ~24,000 of ~120,000 requests, or
+  20% — which pushes the stall into p99, not just p999.
+
+  **So the headline prediction: p99 ratio about 45×, p999 ratio about 36×, and throughput nearly
+  identical.** The throughput agreeing while p99 differs by more than an order of magnitude is the
+  point — it is why a closed-loop load test can report a healthy service that users experience as
+  broken.
+
+- **Predicted (Samarth's, unfilled):** p99 ratio ___× · p999 ratio ___×
 - **Measured:**
 - **Wrong about:**
 

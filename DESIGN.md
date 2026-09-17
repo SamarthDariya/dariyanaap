@@ -278,10 +278,30 @@ Its ceiling is real and will be measured: at ~500 connections the rig pays the s
 context-switching cost that unit 1's thread-per-request service is about to be broken on. That is a
 pleasing irony and a genuine hazard, which is exactly why decision 7 exists.
 
-**M3, open-loop: `kqueue`, K event-loop threads owning C/K connections.** Open-loop needs a socket
-that never blocks the scheduler, because the schedule is the measurement. This is where the rig stops
-being naive, and doing it second means the cost of the event loop is a measured delta rather than an
-assumption.
+**M3, open-loop: a shared schedule and blocking threads. No `kqueue`.**
+
+*Amended at M3.* This said `kqueue` with K event-loop threads owning C/K connections, on the
+argument that "open-loop needs a socket that never blocks the scheduler, because the schedule is the
+measurement". The premise is right and the conclusion does not follow.
+
+What open-loop requires is that **the schedule is never blocked by any one connection**. An event
+loop achieves that by making every socket non-blocking. But so does moving the schedule *out* of the
+connections entirely: one lock-free counter hands out "request i, due at start + i/R", and whichever
+of N blocking threads is free claims the next slot. No single connection can delay the schedule,
+because no connection owns it.
+
+The honest part is that this does not eliminate the queueing an event loop would also not eliminate.
+If every connection is busy when request i comes due, request i waits — and because its latency is
+measured from its *intended* send time, the wait appears as latency. That is not a workaround for the
+missing event loop; it is the correct answer, and it is the whole mechanism by which open-loop
+reports the requests a closed-loop client would never have sent.
+
+What `kqueue` would buy is fewer threads for the same concurrency. E2 measured the cost of not having
+it: the rig saturates at 32 connections and obeys Little's law past that, so thread count is not the
+binding constraint at any concurrency this track uses. Rule 5 says cap the scope, and four hundred
+lines of event loop to move a ceiling nothing reaches is exactly what that rule is for.
+
+`kqueue` stays in the structure diagram as the shape of a later change rather than a promise.
 
 ### Output schema
 
