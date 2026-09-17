@@ -167,6 +167,7 @@ OpenLoopRun run_open_loop(const Protocol& protocol, const OpenLoopPlan& plan) {
 
     run.result.duration = plan.duration;
     run.result.latency = Summary::of(run.histogram, plan.duration);
+    run.rate = plan.rate;
     run.slots_claimed = schedule.claimed();
     run.slots_due = static_cast<uint64_t>(
         plan.rate.rps() * static_cast<double>(plan.duration.count()) / 1000.0);

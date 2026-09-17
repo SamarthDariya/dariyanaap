@@ -50,11 +50,35 @@ struct OpenLoopRun {
     Histogram schedule_lag;
 
     // Slots the schedule handed out, against what the rate demanded for the
-    // measured window. A shortfall means the rig never even claimed the work.
+    // measured window. Reported as information, not as the verdict — see below.
     std::uint64_t slots_claimed = 0;
     std::uint64_t slots_due = 0;
 
-    bool kept_up() const { return slots_claimed >= slots_due; }
+    Rate rate = Rate::per_second(1.0);
+
+    // Did the sender stay on schedule?
+    //
+    // Judged on the MEDIAN lag, not on the slot count, and the first version
+    // of this got it wrong. Comparing slots_claimed against slots_due declared
+    // a 60,000 rps run void while an 80,000 rps run passed, against the same
+    // stalling target — because the slot count fails whenever a stall merely
+    // overlaps the end of the measured window, with no fault of the rig's. The
+    // two runs' lag told the truth plainly: p50 of 32µs at 60k, 67ms at 98k.
+    //
+    // So the question is whether the sender was PERSISTENTLY behind, which is
+    // a question about the middle of the distribution. The threshold is ten
+    // schedule intervals: at 80,000 rps that is 125µs against a measured
+    // median of 38µs, and at 98,000 rps it is 102µs against 67,633µs.
+    //
+    // A momentary shortfall at the window's edge is still visible in
+    // slots_claimed for anyone who wants it.
+    bool kept_up() const {
+        if (schedule_lag.count() == 0) {
+            return true;  // nothing was scheduled, so nothing fell behind
+        }
+        const std::optional<Nanos> median = schedule_lag.percentile(50.0);
+        return median.has_value() && *median < rate.interval() * 10;
+    }
 };
 
 // Resolve once, spawn `connections` workers sharing one schedule, wait, merge.

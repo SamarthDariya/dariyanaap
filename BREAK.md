@@ -180,8 +180,69 @@ load, two modes. Then, mid-run, stall the target for 200ms with `fault::hang_for
   broken.
 
 - **Predicted (Samarth's, unfilled):** p99 ratio ___× · p999 ratio ___×
-- **Measured:**
-- **Wrong about:**
+
+- **Measured:** `./scripts/e3-omission.sh`. One `dariyanaap-null` stalled 200ms every 1000ms, 32
+  connections, 3s measured after 500ms warm-up.
+
+  | mode | req/s | p50 ms | p99 ms | max ms | lag p50 ms | verdict |
+  |---|---|---|---|---|---|---|
+  | closed-loop | 100,641 | 0.241 | **0.414** | 206.124 | — | n/a |
+  | open, 40,000 rps | 37,324 | 0.123 | 201.327 | 206.146 | 0.065 | valid |
+  | open, 60,000 rps | 60,000 | 0.093 | 204.472 | 206.458 | 0.036 | valid |
+  | open, 80,000 rps | 80,000 | 0.104 | **208.667** | 209.657 | 0.042 | valid |
+  | open, 98,000 rps | 93,036 | 105.382 | 210.764 | 212.600 | 104.858 | **VOID** |
+
+  **p99 ratio: 504×** (208.667 / 0.414, at the highest offered rate the rig could sustain).
+  Zero errors of any kind in every row; every run's accounting balanced.
+
+  Three things beyond the headline:
+
+  **Closed-loop does see the stall — it just buries it.** Its max is 206ms, so the information is
+  there. What differs is the stall's *weight*: closed-loop freezes all 32 connections and therefore
+  records 32 slow requests per stall, about 96 of 300,000, or 0.03% — below p999, so it surfaces only
+  in max. Open-loop records every request the schedule demanded during the stall, about 16,000 of
+  80,000 per stall, or 20%. Coordinated omission does not hide the stall; it reduces its share of the
+  distribution by roughly 600×, which moves it from p90 to beyond p999.
+
+  **Open-loop's p99 is ~200ms at every valid rate**, from 40k to 80k. It has to be: the stall is
+  200ms and it catches a fifth of all requests, so the 99th percentile lands near the top of the
+  stalled population whatever the rate. A number that stable is the signature of measuring the target
+  rather than the client.
+
+  **Closed-loop overstates capacity as well as understating latency.** It reports 100,641 rps, but
+  the highest rate the rig can actually sustain against this target is 80,000 — 98,000 goes void.
+  Closed-loop's 100k is an average that includes bursting to catch up after each stall; it is not a
+  rate the service could be offered continuously. So the closed-loop row overstates throughput by 26%
+  *and* understates p99 by 504×, in the same run.
+
+- **Wrong about:** the size of the gap, by a factor of 11, and for a reason this repo should have
+  made me immune to.
+
+  I predicted a p99 ratio of about 45×; it is 504×. The closed-loop half of the prediction was right
+  (0.414ms measured against "~2ms, almost untouched", and the stall landing in max). The error was
+  all in the open-loop estimate, which I put at ~90ms and is 208ms.
+
+  The reasoning behind ~90ms: "the ~8,000 requests due during each stall all accrue latency from
+  their intended send time, with the earliest waiting nearly the full 200ms" — and then I averaged
+  that population to get a middle value. **That is the mean of the stalled requests, not the 99th
+  percentile of the whole distribution.** With a fifth of all requests stalled, the worst 1% overall
+  is the worst 5% of the stalled ones, which sits near the *top* of the stall window, not its middle.
+
+  So I under-predicted by 11× by reasoning about an average, in the repo whose third design decision
+  is that the mean "averages a bimodal distribution whose two modes are the fast path and the problem,
+  and reports neither". The distribution here is exactly that, and I used the mean on it anyway.
+
+  Also wrong, more simply: I predicted the two modes would show "nearly identical" throughput. They
+  cannot be made to, because **closed-loop has no offered-load knob at all** — its throughput is an
+  output. "The same offered load in both modes" is not a thing that can be configured, which is
+  itself the reason closed-loop cannot answer "what is the p99 at 80,000 rps?"
+
+  One correction to the rig came out of this. `kept_up()` first compared slots claimed against slots
+  due, and that declared the 60,000 rps run void while 80,000 passed against the same target — the
+  slot count fails whenever a stall merely overlaps the end of the measured window, through no fault
+  of the rig's. The lag distribution said so plainly (p50 of 36µs at 60k against 104,858µs at 98k),
+  so the verdict now rests on the median lag against ten schedule intervals, and the slot shortfall
+  is reported as information rather than as a judgement.
 
 The specific thing to look for: closed-loop **issues fewer requests** during the stall and never times
 the ones it skipped. Count them. The gap between "requests the schedule demanded" and "requests

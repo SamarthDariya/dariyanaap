@@ -53,15 +53,15 @@ Full reasoning, with the rejected alternatives, in **[DESIGN.md](DESIGN.md)**.
 
 ## Status
 
-**Design: drafted.** **Implementation: M0–M2 complete, M3 next.**
+**Design: drafted.** **Implementation: M0–M3 complete, M4 next.**
 
 | Milestone | What lands | Effort | Status |
 |---|---|---|---|
 | M0 — Skeleton | build, sanitizers, ctest, units, clock | 0.5d | ✅ |
 | M1 — Histogram | HDR buckets, percentiles, merge, CSV | 0.5d | ✅ |
 | M2 — Closed-loop driver | thread-per-conn, HTTP + raw TCP, **self-calibration** | 1d | ✅ |
-| M3 — Open-loop driver | intended-send-time, **coordinated omission demo** | 1d | 🔸 next |
-| M4 — Fault injection | the four primitives + a runtime control channel | 0.5d | ⬜ |
+| M3 — Open-loop driver | intended-send-time, **coordinated omission demo** | 1d | ✅ |
+| M4 — Fault injection | the four primitives + a runtime control channel | 0.5d | 🔸 next |
 | M5 — Output | CSV schema, plot script, submodule smoke test | 0.5d | ⬜ |
 
 ~4 days. The track's estimate is 2–3; if it needs to be 2, cut M4's control channel to environment
@@ -129,17 +129,19 @@ count, and 128 is the only value meeting the ≤1% claim.
 The prediction fields for E1 and E2 are both empty, because both were run before being predicted.
 E3 is the one that matters and gets predicted first.
 
-### M3 — Open-loop driver 🔸
-- [ ] non-blocking sockets + `kqueue`, K event-loop threads owning C/K connections
-- [ ] a fixed-rate schedule: request *i* is due at `start + i/R`, and that is its start timestamp
-- [ ] latency measured from **intended** send time — the one line that kills coordinated omission
-- [ ] schedule-lag metric: how far behind its own plan the sender fell (if this is large, the rig is
-      saturated and the run is void — say so loudly rather than reporting the numbers)
-- [ ] optional: extra connections opened when every existing one is mid-request
-- [ ] **verifier:** the same target, at the same offered load, closed-loop vs open-loop. Predict the
-      p99 gap first, in `BREAK.md`, then measure it.
+### M3 — Open-loop driver ✅
+- [x] `Schedule` — one lock-free counter hands out "request *i*, due at `start + i/R`"
+- [x] **no `kqueue`** — `DESIGN.md` amended: what open-loop needs is that no single connection can
+      delay the schedule, and moving the schedule out of the connections achieves that. E2 showed
+      thread count is not the binding constraint at any concurrency this track uses
+- [x] latency measured from **intended** send time — the two lines that kill coordinated omission
+- [x] schedule-lag metric, and the run declared **VOID** when the sender is persistently behind
+- [x] `--rate` on the CLI; `--stall-every` / `--stall-for` on the null target
+- [x] **E3 done: p99 ratio 504×** — closed-loop 0.414ms, open-loop 208.667ms, same target, and
+      closed-loop *also* overstates throughput by 26%. Prediction was wrong by 11×, by reasoning
+      about a mean. See `BREAK.md`.
 
-### M4 — Fault injection ⬜
+### M4 — Fault injection 🔸
 - [ ] `fault::inject_latency(ms, jitter)` — sleep before responding, jitter to avoid lockstep
 - [ ] `fault::drop_probability(p)` — drop the response, or the connection, and say which
 - [ ] `fault::partition(node_a, node_b)` — symmetric message drop between two named peers (unit 8)
