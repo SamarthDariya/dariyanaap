@@ -12,6 +12,7 @@
 #include "core/errors.hpp"
 #include "core/listener.hpp"
 #include "core/socket.hpp"
+#include "load/closed_loop.hpp"
 #include "load/exchange.hpp"
 #include "load/http.hpp"
 #include "load/http11_get.hpp"
@@ -566,6 +567,10 @@ public:
         : listener_(Listener::bind_ephemeral("127.0.0.1")),
           thread_([this, behaviour = std::move(behaviour)] {
               Socket served = listener_.accept();
+              // Accepted sockets inherit no timeouts, so a target-side read
+              // blocks forever if a client neither sends nor closes. Bounding
+              // it means a broken test fails instead of hanging the suite.
+              served.set_timeouts(Millis(5000), Millis(5000));
               behaviour(served);
           }) {}
 
@@ -770,6 +775,7 @@ public:
                 if (stopping_.load(std::memory_order_relaxed)) {
                     return;  // the destructor's poke, not a real client
                 }
+                served->set_timeouts(Millis(5000), Millis(5000));
                 connections_.emplace_back(
                     [served = std::move(*served), payload]() mutable {
                         serve(served, payload);
@@ -810,7 +816,9 @@ private:
                 served.write_all(std::span<const char>(buffer.data(), payload));
             }
         } catch (const IoError&) {
-            // The client vanished mid-exchange. Not the target's problem.
+            // The client vanished mid-exchange, or stopped talking for five
+            // seconds. Either way this connection is finished; it is not the
+            // target's job to wait forever.
         }
     }
 
@@ -947,4 +955,161 @@ TEST_CASE("a target that times out churns connections rather than reusing a bad 
             resolve(Endpoint("127.0.0.1", listener.port())), Millis(500));
     } catch (const IoError&) {}
     silent.join();
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 2.10 — run_closed_loop
+// ---------------------------------------------------------------------------
+
+TEST_CASE("a one-connection run measures, accounts, and reports its own floor") {
+    const RawEcho protocol(64);
+    EchoTarget target(64);
+
+    ClosedLoopPlan plan;
+    plan.target = Endpoint("127.0.0.1", target.port());
+    plan.connections = 1;
+    plan.duration = Millis(250);
+
+    const ClosedLoopRun run = run_closed_loop(protocol, plan);
+
+    CHECK(run.connections_requested == 1);
+    CHECK(run.connections_started == 1);
+    CHECK(run.connections_opened == 1);
+    CHECK(run.result.attempted > 0);
+    CHECK(run.result.errors.total() == 0);
+    CHECK(run.result.consistent());
+    REQUIRE(run.result.latency.has_value());
+    CHECK(run.result.latency->samples == run.result.attempted);
+    CHECK(run.result.duration == Millis(250));
+
+    // measured_resolution() finally has a caller, at the warm-up boundary.
+    CHECK(run.clock_resolution > Nanos(0));
+    CHECK(run.clock_resolution < Micros(50));
+}
+
+TEST_CASE("more connections offer more load, and every worker is accounted for") {
+    const RawEcho protocol(64);
+    EchoTarget target(64);
+
+    auto sweep = [&](std::size_t connections) {
+        ClosedLoopPlan plan;
+        plan.target = Endpoint("127.0.0.1", target.port());
+        plan.connections = connections;
+        plan.duration = Millis(250);
+        return run_closed_loop(protocol, plan);
+    };
+
+    const ClosedLoopRun one = sweep(1);
+    const ClosedLoopRun eight = sweep(8);
+
+    CHECK(eight.connections_started == 8);
+    CHECK(eight.connections_opened == 8);
+    CHECK(eight.result.consistent());
+    // Not a throughput claim — just that eight connections did more work than
+    // one against a target with a thread per connection.
+    CHECK(eight.result.attempted > one.result.attempted);
+    CHECK(eight.result.latency->samples == eight.result.attempted);
+}
+
+TEST_CASE("the summary's duration is the measured window, not the wall clock") {
+    // Throughput is samples over duration, so charging warm-up to it would
+    // under-report every run that used one.
+    const RawEcho protocol(32);
+    EchoTarget target(32);
+
+    ClosedLoopPlan plan;
+    plan.target = Endpoint("127.0.0.1", target.port());
+    plan.connections = 2;
+    plan.warmup = Millis(120);
+    plan.duration = Millis(200);
+
+    const Stopwatch watch;
+    const ClosedLoopRun run = run_closed_loop(protocol, plan);
+    const Nanos wall = watch.elapsed();
+
+    CHECK(wall >= Millis(320));                    // warm-up really happened
+    CHECK(run.result.duration == Millis(200));     // but is not in the duration
+    CHECK(run.result.latency->duration == Millis(200));
+    CHECK(run.result.consistent());
+}
+
+TEST_CASE("a run against nothing reports connect errors and no distribution") {
+    // Every worker fails identically, so this exercises the merge of error
+    // counts as well as the absent Summary.
+    const RawEcho protocol(16);
+    ClosedLoopPlan plan;
+    plan.target = Endpoint("127.0.0.1", dead_port());
+    plan.connections = 4;
+    plan.duration = Millis(250);
+    plan.worker.reconnect_delay = Millis(40);
+
+    const ClosedLoopRun run = run_closed_loop(protocol, plan);
+
+    CHECK(run.connections_started == 4);
+    CHECK(run.connections_opened == 0);
+    CHECK(run.result.errors.connect > 0);
+    CHECK(run.result.errors.connect == run.result.attempted);
+    CHECK_FALSE(run.result.latency.has_value());   // nothing to summarise
+    CHECK(run.result.consistent());
+    // Four workers at ~40ms each over 250ms: tens, not thousands.
+    CHECK(run.result.attempted < 200);
+}
+
+TEST_CASE("a target that hangs produces timeouts, churn, and honest accounting") {
+    const RawEcho protocol(16);
+    Listener listener = Listener::bind_ephemeral("127.0.0.1");
+    std::atomic<bool> stop{false};
+    std::thread silent([&listener, &stop] {
+        std::vector<Socket> held;
+        while (!stop.load(std::memory_order_relaxed)) {
+            try { held.push_back(listener.accept()); }
+            catch (const IoError&) { return; }
+            if (held.size() > 128) held.clear();
+        }
+    });
+
+    ClosedLoopPlan plan;
+    plan.target = Endpoint("127.0.0.1", listener.port());
+    plan.connections = 3;
+    plan.duration = Millis(400);
+    plan.worker.read_timeout = Millis(60);
+    plan.worker.reconnect_delay = Millis(1);
+
+    const ClosedLoopRun run = run_closed_loop(protocol, plan);
+
+    CHECK(run.result.errors.timeout > 0);
+    CHECK(run.connections_opened > run.connections_started);  // churn
+    CHECK(run.result.consistent());
+    // Timeouts are in the distribution, at their real elapsed time.
+    REQUIRE(run.result.latency.has_value());
+    CHECK(run.result.latency->samples == run.result.errors.timeout);
+    CHECK(run.result.latency->max >= Millis(60));
+
+    stop.store(true, std::memory_order_relaxed);
+    try {
+        const Socket poke = Socket::connect_any(
+            resolve(Endpoint("127.0.0.1", listener.port())), Millis(500));
+    } catch (const IoError&) {}
+    silent.join();
+}
+
+TEST_CASE("merged results equal the sum of the workers that produced them") {
+    // The claim decision 5 rests on: per-thread histograms, merged once, with
+    // nothing atomic and nothing locked on the request path.
+    const RawEcho protocol(48);
+    EchoTarget target(48);
+
+    ClosedLoopPlan plan;
+    plan.target = Endpoint("127.0.0.1", target.port());
+    plan.connections = 6;
+    plan.duration = Millis(250);
+
+    const ClosedLoopRun run = run_closed_loop(protocol, plan);
+
+    REQUIRE(run.result.latency.has_value());
+    // Every attempt succeeded, so the merged histogram holds all of them.
+    CHECK(run.result.latency->samples == run.result.attempted);
+    CHECK(run.result.errors.total() == 0);
+    CHECK(run.result.latency->p50 <= run.result.latency->p99);
+    CHECK(run.result.latency->p99 <= run.result.latency->p999);
 }
