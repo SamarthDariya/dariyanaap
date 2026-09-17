@@ -150,6 +150,12 @@ if(DARIYANAAP_BUILD_CLI)
   add_executable(hist_verify apps/hist_verify.cpp)
   target_link_libraries(hist_verify PRIVATE dariyanaap_stats)
   target_compile_options(hist_verify PRIVATE ${DARIYANAAP_WARNINGS})
+
+  # The calibration target for E2. Replies as fast as a socket allows, so the
+  # number E2 produces is the rig's ceiling rather than a server's.
+  add_executable(dariyanaap-null apps/dariyanaap_null.cpp)
+  target_link_libraries(dariyanaap-null PRIVATE dariyanaap_core)
+  target_compile_options(dariyanaap-null PRIVATE ${DARIYANAAP_WARNINGS})
 endif()
 
 # ---------------------------------------------------------------------------
