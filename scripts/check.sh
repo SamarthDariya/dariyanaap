@@ -5,6 +5,9 @@
 #     ./scripts/check.sh          build + test          (the inner loop)
 #     ./scripts/check.sh --all    also ASan/UBSan+TSan  (before calling a chunk done)
 #
+# Run it BEFORE every commit. Chunk 3.1 was committed with a test file that
+# did not compile, because the check ran and its failure was read past.
+#
 # Build directories are gitignored and persist, so the fast path is a rebuild
 # of whatever changed, not a configure.
 set -euo pipefail
