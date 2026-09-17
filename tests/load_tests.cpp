@@ -18,6 +18,7 @@
 #include "load/http11_get.hpp"
 #include "load/raw_echo.hpp"
 #include "load/run_result.hpp"
+#include "load/open_loop.hpp"
 #include "load/schedule.hpp"
 #include "load/worker.hpp"
 
@@ -1200,4 +1201,94 @@ TEST_CASE("one schedule shared beats one per thread, which would multiply the ra
     // 1000 claims at 1000 rps is one second of schedule, whoever claimed them.
     CHECK(shared.claimed() == 1000);
     CHECK(shared.claim().due == start + Secs(1));
+}
+
+// ---------------------------------------------------------------------------
+// Chunks 3.2-3.3 — run_open_loop
+// ---------------------------------------------------------------------------
+
+TEST_CASE("an open-loop run offers the rate it was configured with") {
+    // Closed-loop offers whatever the target can take. Open-loop offers what
+    // the operator asked for, and this is the check that it does.
+    const RawEcho protocol(64);
+    EchoTarget target(64);
+
+    OpenLoopPlan plan;
+    plan.target = Endpoint("127.0.0.1", target.port());
+    plan.rate = Rate::per_second(2000.0);
+    plan.connections = 4;
+    plan.duration = Millis(500);
+
+    const OpenLoopRun run = run_open_loop(protocol, plan);
+
+    CHECK(run.connections_started == 4);
+    CHECK(run.result.errors.total() == 0);
+    CHECK(run.result.consistent());
+    CHECK(run.slots_due == 1000);            // 2000 rps for half a second
+    CHECK(run.kept_up());
+    // Within 10%: the schedule is exact but the run boundary is not.
+    CHECK(run.result.attempted > 850);
+    CHECK(run.result.attempted < 1150);
+}
+
+TEST_CASE("a rate well inside the target's ability leaves almost no schedule lag") {
+    // The self-check with teeth: if the rig cannot keep up, the offered load
+    // was not what was configured and the run is void.
+    const RawEcho protocol(64);
+    EchoTarget target(64);
+
+    OpenLoopPlan plan;
+    plan.target = Endpoint("127.0.0.1", target.port());
+    plan.rate = Rate::per_second(1000.0);
+    plan.connections = 8;
+    plan.duration = Millis(500);
+
+    const OpenLoopRun run = run_open_loop(protocol, plan);
+
+    CHECK(run.kept_up());
+    REQUIRE(run.schedule_lag.count() > 0);
+    // Sleeping until a due time costs a scheduler wakeup, so lag is not zero —
+    // but it should be tens of microseconds, not milliseconds.
+    CHECK(run.schedule_lag.percentile(99.0).value() < Millis(5));
+}
+
+TEST_CASE("latency is measured from the due time, not from the send") {
+    // The two lines that separate open-loop from closed-loop. A rate far past
+    // what one connection can carry makes requests queue, and the queueing has
+    // to appear as latency rather than vanish.
+    const RawEcho protocol(64);
+    EchoTarget target(64);
+
+    OpenLoopPlan plan;
+    plan.target = Endpoint("127.0.0.1", target.port());
+    plan.rate = Rate::per_second(50'000.0);
+    plan.connections = 1;   // one connection cannot carry 50k rps
+    plan.duration = Millis(400);
+
+    const OpenLoopRun run = run_open_loop(protocol, plan);
+
+    REQUIRE(run.result.latency.has_value());
+    // The rig could not keep up, and says so rather than reporting the rate.
+    CHECK_FALSE(run.kept_up());
+    CHECK(run.slots_due > run.slots_claimed);
+    // Requests waited for the connection, and the wait is in the latency.
+    CHECK(run.schedule_lag.percentile(50.0).value() > Micros(100));
+    CHECK(run.result.latency->p50 >= run.schedule_lag.percentile(50.0).value());
+}
+
+TEST_CASE("open-loop against nothing reports connect errors and stays consistent") {
+    const RawEcho protocol(16);
+    OpenLoopPlan plan;
+    plan.target = Endpoint("127.0.0.1", dead_port());
+    plan.rate = Rate::per_second(500.0);
+    plan.connections = 2;
+    plan.duration = Millis(300);
+    plan.worker.reconnect_delay = Millis(40);
+
+    const OpenLoopRun run = run_open_loop(protocol, plan);
+
+    CHECK(run.result.errors.connect > 0);
+    CHECK(run.result.errors.connect == run.result.attempted);
+    CHECK_FALSE(run.result.latency.has_value());
+    CHECK(run.result.consistent());
 }
