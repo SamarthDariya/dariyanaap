@@ -10,6 +10,16 @@ using namespace std;
 
 namespace dariyanaap {
 
+bool Flags::wants_help(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        const string argument = argv[i];
+        if (argument == "--help" || argument == "-h") {
+            return true;
+        }
+    }
+    return false;
+}
+
 Flags Flags::parse(int argc, char** argv, const vector<string>& known) {
     Flags flags;
     for (int i = 1; i < argc; ++i) {

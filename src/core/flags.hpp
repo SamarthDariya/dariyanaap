@@ -25,6 +25,15 @@ public:
     // missing value. `known` is every name this program accepts.
     static Flags parse(int argc, char** argv, const std::vector<std::string>& known);
 
+    // Was --help asked for?
+    //
+    // Checked before parse(), because --help takes no value and parse() would
+    // reject it for that. Handling it inside parse() would mean either
+    // special-casing one flag in the grammar or making values optional, and
+    // the second would let "--connections --duration 10" silently read the
+    // next flag as a value.
+    static bool wants_help(int argc, char** argv);
+
     bool has(const std::string& name) const;
 
     // Throw UsageError if present but unparseable; return the default if

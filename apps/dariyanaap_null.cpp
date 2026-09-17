@@ -93,6 +93,17 @@ void serve(Socket client, size_t payload) {
 
 int main(int argc, char** argv) {
     try {
+        if (Flags::wants_help(argc, argv)) {
+            fputs("usage: dariyanaap-null [options]\n"
+                  "  --host H            bind address (default 127.0.0.1)\n"
+                  "  --port P            0 for a kernel-chosen port (default 0)\n"
+                  "  --payload N         bytes echoed each way (default 64)\n"
+                  "  --backlog N         listen backlog; macOS clamps to somaxconn\n"
+                  "  --stall-every MS    freeze every connection periodically\n"
+                  "  --stall-for MS      for this long (both or neither)\n",
+                  stdout);
+            return 0;
+        }
         const Flags flags = Flags::parse(
             argc, argv,
             {"host", "port", "payload", "backlog", "stall-every", "stall-for"});

@@ -157,6 +157,10 @@ void write_csv(const string& directory, const RunResult& result, const Histogram
 
 int main(int argc, char** argv) {
     try {
+        if (Flags::wants_help(argc, argv)) {
+            fputs(kUsage, stdout);
+            return 0;   // asking for help is not a failure
+        }
         const Flags flags = Flags::parse(
             argc, argv,
             {"target", "connections", "duration", "warmup", "protocol", "payload", "path",
