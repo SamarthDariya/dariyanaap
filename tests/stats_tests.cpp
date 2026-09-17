@@ -14,6 +14,7 @@
 #include "stats/histogram.hpp"
 #include "stats/csv.hpp"
 #include "stats/summary.hpp"
+#include "stats/timeseries.hpp"
 
 using namespace dariyanaap;
 
@@ -742,4 +743,83 @@ TEST_CASE("a value with a comma is quoted, so columns do not shift") {
     // Unconditional quoting would be simpler and worse: every numeric column
     // would arrive as a string in pandas and R.
     CHECK(csv::quoted("1234") == "1234");
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 5.1 — TimeSeries
+// ---------------------------------------------------------------------------
+
+TEST_CASE("latency lands in the second it finished in") {
+    const MonotonicClock::Instant start = MonotonicClock::now();
+    TimeSeries series(start);
+    TimeSeries::Writer writer = series.writer();
+
+    writer.record(start + Millis(100), Micros(10));
+    writer.record(start + Millis(900), Micros(20));
+    writer.record(start + Millis(1500), Micros(30));
+    writer.record(start + Millis(2500), Micros(40));
+    writer.flush();
+
+    REQUIRE(series.seconds().size() == 3);
+    CHECK(series.seconds()[0].count() == 2);
+    CHECK(series.seconds()[1].count() == 1);
+    CHECK(series.seconds()[2].count() == 1);
+    CHECK(series.seconds()[2].max() == Micros(40));
+}
+
+TEST_CASE("the last partial second survives, because it is the one that matters") {
+    // A run that ends mid-degradation ends inside a partial second. Dropping
+    // it would remove exactly the evidence the timeseries exists to provide.
+    const MonotonicClock::Instant start = MonotonicClock::now();
+    TimeSeries series(start);
+    TimeSeries::Writer writer = series.writer();
+    writer.record(start + Millis(100), Micros(10));
+    CHECK(series.seconds().empty());   // still pending
+    writer.flush();
+    REQUIRE(series.seconds().size() == 1);
+    CHECK(series.seconds()[0].count() == 1);
+}
+
+TEST_CASE("many writers fill one series without a lock on the request path") {
+    // Each writer holds one second's histogram and merges at a boundary, so
+    // the lock is taken once per writer per second rather than per request.
+    const MonotonicClock::Instant start = MonotonicClock::now();
+    TimeSeries series(start);
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 8; ++t) {
+        threads.emplace_back([&series, start] {
+            TimeSeries::Writer writer = series.writer();
+            for (int i = 0; i < 3'000; ++i) {
+                writer.record(start + Millis(i % 3000), Micros(1 + i % 50));
+            }
+            writer.flush();
+        });
+    }
+    for (std::thread& t : threads) t.join();
+
+    std::uint64_t total = 0;
+    for (const Histogram& second : series.seconds()) total += second.count();
+    CHECK(total == 8 * 3'000);          // nothing lost across the boundaries
+    CHECK(series.seconds().size() == 3);
+}
+
+TEST_CASE("a second with no samples gets a row of zeros, not no row") {
+    // A target that stopped answering entirely would otherwise look identical
+    // to a gap in the file, and "the file has a gap" and "the service was
+    // down" are different findings.
+    const MonotonicClock::Instant start = MonotonicClock::now();
+    TimeSeries series(start);
+    TimeSeries::Writer writer = series.writer();
+    writer.record(start + Millis(10), Micros(5));
+    writer.record(start + Millis(2100), Micros(5));   // second 1 is empty
+    writer.flush();
+
+    std::ostringstream out;
+    csv::write_timeseries(out, series.seconds());
+    const std::vector<std::string> rows = lines_of(out.str());
+    REQUIRE(rows.size() == 4);   // header + 3 seconds
+    CHECK(rows[0] == "second,count,p50_ns,p90_ns,p99_ns,max_ns");
+    CHECK(split(rows[2], ',')[0] == "1");
+    CHECK(split(rows[2], ',')[1] == "0");   // the empty second, present
 }

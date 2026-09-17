@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <vector>
 #include <memory>
 #include <string>
 
@@ -21,6 +22,7 @@
 #include "load/open_loop.hpp"
 #include "load/raw_echo.hpp"
 #include "stats/csv.hpp"
+#include "stats/timeseries.hpp"
 
 using namespace dariyanaap;
 using namespace std;
@@ -38,7 +40,8 @@ constexpr const char* kUsage =
     "  --path P            http path (default /)\n"
     "  --read-timeout MS   (default 1000)\n"
     "  --connect-timeout MS (default 1000)\n"
-    "  --csv-dir DIR       write summary.csv and histogram.csv here\n";
+    "  --csv-dir DIR       write summary.csv, histogram.csv and timeseries.csv here\n"
+    "  --timeseries 1      bucket latency by wall-clock second as well\n";
 
 double as_ms(Nanos value) {
     return static_cast<double>(value.count()) / 1e6;
@@ -98,7 +101,8 @@ void report(const RunResult& result, const ClosedLoopPlan& plan, const char* mod
 
 void write_csv(const string& directory, const RunResult& result, const Histogram& histogram,
                const ClosedLoopPlan& plan, const Flags& flags, const char* mode,
-               size_t started, uint64_t opened, Nanos resolution) {
+               size_t started, uint64_t opened, Nanos resolution,
+               const vector<Histogram>& per_second) {
     const string summary_path = directory + "/summary.csv";
 
     // Append, and write the header only for a new file, so a sweep's six steps
@@ -137,6 +141,16 @@ void write_csv(const string& directory, const RunResult& result, const Histogram
     }
     csv::write_histogram(histogram_file, histogram);
     printf("  wrote %s and %s\n", summary_path.c_str(), histogram_path.c_str());
+
+    if (!per_second.empty()) {
+        const string series_path = directory + "/timeseries.csv";
+        ofstream series(series_path);
+        if (!series) {
+            throw IoError("cannot write " + series_path);
+        }
+        csv::write_timeseries(series, per_second);
+        printf("  wrote %s (%zu seconds)\n", series_path.c_str(), per_second.size());
+    }
 }
 
 }  // namespace
@@ -146,7 +160,7 @@ int main(int argc, char** argv) {
         const Flags flags = Flags::parse(
             argc, argv,
             {"target", "connections", "duration", "warmup", "protocol", "payload", "path",
-             "read-timeout", "connect-timeout", "csv-dir", "rate"});
+             "read-timeout", "connect-timeout", "csv-dir", "rate", "timeseries"});
 
         if (!flags.has("target")) {
             fputs(kUsage, stderr);
@@ -162,6 +176,7 @@ int main(int argc, char** argv) {
         plan.worker.write_timeout = plan.worker.read_timeout;
         plan.worker.connect_timeout =
             Millis(static_cast<int64_t>(flags.number("connect-timeout", 1000)));
+        plan.timeseries = flags.number("timeseries", 0) != 0;
 
         if (plan.connections == 0) {
             throw UsageError("--connections must be at least 1");
@@ -187,7 +202,7 @@ int main(int argc, char** argv) {
             if (flags.has("csv-dir")) {
                 write_csv(flags.text("csv-dir", "."), run.result, run.histogram, plan,
                           flags, "closed-loop", run.connections_started,
-                          run.connections_opened, run.clock_resolution);
+                          run.connections_opened, run.clock_resolution, run.per_second);
             }
             return run.result.consistent() ? 0 : 1;
         }
@@ -221,7 +236,7 @@ int main(int argc, char** argv) {
         if (flags.has("csv-dir")) {
             write_csv(flags.text("csv-dir", "."), run.result, run.histogram, plan, flags,
                       "open-loop", run.connections_started, run.connections_opened,
-                      run.clock_resolution);
+                      run.clock_resolution, {});
         }
         return (run.result.consistent() && run.kept_up()) ? 0 : 1;
     } catch (const UsageError& e) {

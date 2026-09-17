@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "core/address.hpp"
@@ -11,6 +12,7 @@
 #include "load/protocol.hpp"
 #include "load/run_result.hpp"
 #include "stats/histogram.hpp"
+#include "stats/timeseries.hpp"
 
 namespace dariyanaap {
 
@@ -54,8 +56,11 @@ struct WorkerConfig {
 // churn, so a run where 500 connections became 50,000 opens says so.
 class ConnectionWorker {
 public:
+    // `series` may be null: a run that does not want a per-second breakdown
+    // should not pay for one, and the check is once per request against a
+    // pointer already in cache.
     ConnectionWorker(const Protocol& protocol, std::vector<SocketAddress> addresses,
-                     WorkerConfig config);
+                     WorkerConfig config, TimeSeries* series = nullptr);
 
     // Work until `deadline`. Nothing that STARTS before `record_from` is
     // counted at all — not in the histogram, and not in the error counters
@@ -63,6 +68,10 @@ public:
     // as attempts but excluded from the histogram, RunResult::consistent()
     // would report every run as having lost requests.
     void run(MonotonicClock::Instant record_from, MonotonicClock::Instant deadline);
+
+    // Flush the current partial second. Called after the thread joins, on the
+    // merging thread, so the Writer is not touched concurrently.
+    void finish();
 
     const Histogram& histogram() const { return histogram_; }
     const ErrorCounts& errors() const { return errors_; }
@@ -80,6 +89,7 @@ private:
     std::vector<char> received_;
 
     Histogram histogram_;
+    std::optional<TimeSeries::Writer> series_;
     ErrorCounts errors_;
     std::uint64_t attempted_ = 0;
     std::uint64_t connections_opened_ = 0;

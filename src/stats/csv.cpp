@@ -100,4 +100,21 @@ void write_histogram(ostream& out, const Histogram& histogram) {
     }
 }
 
+void write_timeseries(ostream& out, const vector<Histogram>& seconds) {
+    out << "second,count,p50_ns,p90_ns,p99_ns,max_ns\n";
+    for (size_t i = 0; i < seconds.size(); ++i) {
+        const Histogram& histogram = seconds[i];
+        out << i << ',' << histogram.count() << ',';
+        if (histogram.count() == 0) {
+            // Empty, and said so rather than omitted. See the header.
+            out << "0,0,0,0\n";
+            continue;
+        }
+        out << histogram.percentile(50.0).value().count() << ','
+            << histogram.percentile(90.0).value().count() << ','
+            << histogram.percentile(99.0).value().count() << ','
+            << histogram.max().count() << '\n';
+    }
+}
+
 }  // namespace dariyanaap::csv

@@ -30,9 +30,13 @@ ClosedLoopRun run_closed_loop(const Protocol& protocol, const ClosedLoopPlan& pl
     ClosedLoopRun run;
     run.connections_requested = plan.connections;
 
+    TimeSeries series(record_from);
+    TimeSeries* const series_or_null = plan.timeseries ? &series : nullptr;
+
     for (size_t i = 0; i < plan.connections; ++i) {
         workers.push_back(
-            make_unique<ConnectionWorker>(protocol, addresses, plan.worker));
+            make_unique<ConnectionWorker>(protocol, addresses, plan.worker,
+                                          series_or_null));
         try {
             threads.emplace_back([worker = workers.back().get(), record_from, deadline] {
                 worker->run(record_from, deadline);
@@ -60,6 +64,7 @@ ClosedLoopRun run_closed_loop(const Protocol& protocol, const ClosedLoopPlan& pl
     // atomic and nothing locks, which is the claim decision 5 rests on and the
     // reason TSan is wired into this repo.
     for (const unique_ptr<ConnectionWorker>& worker : workers) {
+        worker->finish();  // flush the last partial second, after the join
         run.histogram.merge(worker->histogram());
         run.result.errors.merge(worker->errors());
         run.result.attempted += worker->attempted();
@@ -68,6 +73,7 @@ ClosedLoopRun run_closed_loop(const Protocol& protocol, const ClosedLoopPlan& pl
 
     run.result.duration = plan.duration;
     run.result.latency = Summary::of(run.histogram, plan.duration);
+    run.per_second = series.seconds();
     return run;
 }
 

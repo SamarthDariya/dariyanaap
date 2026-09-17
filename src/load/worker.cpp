@@ -13,13 +13,16 @@ namespace dariyanaap {
 
 ConnectionWorker::ConnectionWorker(const Protocol& protocol,
                                    vector<SocketAddress> addresses,
-                                   WorkerConfig config)
+                                   WorkerConfig config, TimeSeries* series)
     : protocol_(protocol),
       addresses_(std::move(addresses)),
       config_(config),
       read_buffer_(config.read_buffer_bytes),
       received_() {
     received_.reserve(config.read_buffer_bytes);
+    if (series != nullptr) {
+        series_.emplace(series->writer());
+    }
 }
 
 void ConnectionWorker::run(MonotonicClock::Instant record_from,
@@ -61,6 +64,14 @@ void ConnectionWorker::run(MonotonicClock::Instant record_from,
 
         if (measuring) {
             ++attempted_;
+            // Same three outcomes that reach the histogram (chunk 2.8), so the
+            // per-second view and the run-wide view describe the same
+            // population — otherwise they would disagree and both be suspect.
+            if (series_ && (result.outcome == Outcome::Succeeded ||
+                            result.outcome == Outcome::Rejected ||
+                            result.outcome == Outcome::TimedOut)) {
+                series_->record(MonotonicClock::now(), result.elapsed);
+            }
             switch (result.outcome) {
                 case Outcome::Succeeded:
                     histogram_.record(result.elapsed);
@@ -92,6 +103,14 @@ void ConnectionWorker::run(MonotonicClock::Instant record_from,
         if (!result.connection_usable) {
             socket.reset();
         }
+    }
+}
+
+void ConnectionWorker::finish() {
+    if (series_) {
+        // Without this the last partial second is dropped — and in a run that
+        // ends mid-degradation, that is the second worth having.
+        series_->flush();
     }
 }
 

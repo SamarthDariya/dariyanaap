@@ -2,6 +2,7 @@
 
 #include <ostream>
 #include <string>
+#include <vector>
 
 #include "stats/histogram.hpp"
 #include "stats/summary.hpp"
@@ -54,5 +55,13 @@ void write_absent_summary_row(std::ostream& out);
 // slot = -1 and high_ns = the exact max. The invariant a reader can rely on:
 // the count column sums to the run's total sample count.
 void write_histogram(std::ostream& out, const Histogram& histogram);
+
+// One row per elapsed second: when the run degraded, not just by how much.
+//
+// A second with no samples still gets a row, with a count of zero. That is the
+// most informative row in the file — a target that stopped answering entirely
+// looks identical to a missing row otherwise, and "the file has a gap" and
+// "the service was down" are different findings.
+void write_timeseries(std::ostream& out, const std::vector<Histogram>& seconds);
 
 }  // namespace dariyanaap::csv

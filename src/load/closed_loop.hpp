@@ -9,6 +9,7 @@
 #include "load/run_result.hpp"
 #include "load/worker.hpp"
 #include "stats/histogram.hpp"
+#include "stats/timeseries.hpp"
 
 namespace dariyanaap {
 
@@ -30,6 +31,10 @@ struct ClosedLoopPlan {
     Millis warmup{0};
 
     WorkerConfig worker;
+
+    // Bucket latency by wall-clock second as well as run-wide. Off by default:
+    // a run that does not want it should not pay a pointer check per request.
+    bool timeseries = false;
 };
 
 // One closed-loop run, and everything a reader needs to distrust it.
@@ -63,6 +68,9 @@ struct ClosedLoopRun {
     // to rise with connections, and expect a 1-connection run to sit near the
     // hardware tick.
     Nanos clock_resolution{0};
+
+    // One histogram per elapsed second. Empty unless the plan asked for it.
+    std::vector<Histogram> per_second;
 };
 
 // Resolve once, spawn `connections` workers, wait, merge.
