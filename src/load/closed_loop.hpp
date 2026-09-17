@@ -8,6 +8,7 @@
 #include "load/protocol.hpp"
 #include "load/run_result.hpp"
 #include "load/worker.hpp"
+#include "stats/histogram.hpp"
 
 namespace dariyanaap {
 
@@ -34,6 +35,11 @@ struct ClosedLoopPlan {
 // One closed-loop run, and everything a reader needs to distrust it.
 struct ClosedLoopRun {
     RunResult result;
+
+    // The merged distribution, kept and not just summarised. Decision 4 puts
+    // raw slot counts in the CSV so a run can be re-percentiled or merged
+    // months later, and a Summary has already thrown that away.
+    Histogram histogram;
 
     std::size_t connections_requested = 0;
 

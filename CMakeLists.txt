@@ -156,6 +156,10 @@ if(DARIYANAAP_BUILD_CLI)
   add_executable(dariyanaap-null apps/dariyanaap_null.cpp)
   target_link_libraries(dariyanaap-null PRIVATE dariyanaap_core)
   target_compile_options(dariyanaap-null PRIVATE ${DARIYANAAP_WARNINGS})
+
+  add_executable(dariyanaap apps/dariyanaap.cpp)
+  target_link_libraries(dariyanaap PRIVATE dariyanaap_load)
+  target_compile_options(dariyanaap PRIVATE ${DARIYANAAP_WARNINGS})
 endif()
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ostream>
+#include <string>
 
 #include "stats/histogram.hpp"
 #include "stats/summary.hpp"
@@ -20,11 +21,26 @@ namespace dariyanaap::csv {
 // exercised by writing to disk does not get tested, and these files are the
 // interface every later repo reads.
 
+// One value, quoted if it needs to be.
+//
+// Chunk 1.7 promised this: "M5 adds target and mode, which are strings, and it
+// has to add escaping at the same time." The CLI is where that lands. A target
+// name containing a comma would otherwise shift every column to its right,
+// and the resulting file parses cleanly into the wrong numbers.
+std::string quoted(const std::string& value);
+
 // Split so a sweep — the same target at 1, 10, 100, 500 connections — writes
 // one header and one row per run into a single file. That file is the input to
 // every "throughput vs concurrency" plot in the track.
 void write_summary_header(std::ostream& out);
 void write_summary_row(std::ostream& out, const Summary& summary);
+
+// A row for a run that produced no distribution — every connect refused, say.
+//
+// Lives here rather than in the caller so it cannot drift from the header. A
+// caller writing its own row of zeros would silently misalign the moment a
+// column is added, and the file would still parse.
+void write_absent_summary_row(std::ostream& out);
 
 // Header and rows together: one histogram file per run.
 //

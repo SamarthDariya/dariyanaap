@@ -715,3 +715,31 @@ TEST_CASE("memory does not grow with sample count") {
     CHECK(sizeof(small) == sizeof(large));
     static_assert(sizeof(Histogram) == buckets::kCount * sizeof(std::uint64_t) + 24);
 }
+
+TEST_CASE("the absent-summary row has exactly as many columns as the header") {
+    // Derived from the column list rather than written out, so adding a column
+    // cannot leave this row misaligned in a file that still parses.
+    std::ostringstream header;
+    csv::write_summary_header(header);
+    std::ostringstream absent;
+    csv::write_absent_summary_row(absent);
+
+    const std::vector<std::string> header_fields = split(lines_of(header.str())[0], ',');
+    const std::vector<std::string> absent_fields = split(lines_of(absent.str())[0], ',');
+    CHECK(absent_fields.size() == header_fields.size());
+    CHECK(absent_fields[0] == "0");   // samples
+    CHECK(absent_fields[2] == "1");   // percentiles_bounded
+}
+
+TEST_CASE("a value with a comma is quoted, so columns do not shift") {
+    // Chunk 1.7 owed this. A target name containing a comma would otherwise
+    // move every column to its right, and the file would parse cleanly into
+    // the wrong numbers.
+    CHECK(csv::quoted("127.0.0.1:8080") == "127.0.0.1:8080");
+    CHECK(csv::quoted("a,b") == "\"a,b\"");
+    CHECK(csv::quoted("say \"hi\"") == "\"say \"\"hi\"\"\"");
+    CHECK(csv::quoted("two\nlines") == "\"two\nlines\"");
+    // Unconditional quoting would be simpler and worse: every numeric column
+    // would arrive as a string in pandas and R.
+    CHECK(csv::quoted("1234") == "1234");
+}

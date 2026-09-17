@@ -59,16 +59,15 @@ ClosedLoopRun run_closed_loop(const Protocol& protocol, const ClosedLoopPlan& pl
     // Merged on one thread after every worker has stopped. Nothing above is
     // atomic and nothing locks, which is the claim decision 5 rests on and the
     // reason TSan is wired into this repo.
-    Histogram merged;
     for (const unique_ptr<ConnectionWorker>& worker : workers) {
-        merged.merge(worker->histogram());
+        run.histogram.merge(worker->histogram());
         run.result.errors.merge(worker->errors());
         run.result.attempted += worker->attempted();
         run.connections_opened += worker->connections_opened();
     }
 
     run.result.duration = plan.duration;
-    run.result.latency = Summary::of(merged, plan.duration);
+    run.result.latency = Summary::of(run.histogram, plan.duration);
     return run;
 }
 

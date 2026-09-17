@@ -1,6 +1,7 @@
 #include "stats/csv.hpp"
 
 #include <iomanip>
+#include <string_view>
 
 #include "stats/buckets.hpp"
 
@@ -17,6 +18,27 @@ constexpr const char* kSummaryColumns =
     "p50_ns,p90_ns,p99_ns,p999_ns,max_ns";
 
 }  // namespace
+
+string quoted(const string& value) {
+    // RFC 4180: quote if the value holds a comma, a quote or a newline, and
+    // double any quote inside. Unconditional quoting would be simpler and is
+    // worse — every numeric column would arrive as a string in pandas and R.
+    const bool needs =
+        value.find_first_of(",\"\r\n") != string::npos;
+    if (!needs) {
+        return value;
+    }
+    string out = "\"";
+    for (const char c : value) {
+        if (c == '"') {
+            out += "\"\"";
+        } else {
+            out += c;
+        }
+    }
+    out += '"';
+    return out;
+}
 
 void write_summary_header(ostream& out) {
     out << kSummaryColumns << '\n';
@@ -35,6 +57,25 @@ void write_summary_row(ostream& out, const Summary& summary) {
         << summary.p99.count() << ','
         << summary.p999.count() << ','
         << summary.max.count() << '\n';
+}
+
+void write_absent_summary_row(ostream& out) {
+    // Derived from the column list, so adding a column cannot desynchronise
+    // this from the header. percentiles_bounded is 1: there were no samples
+    // above 60s because there were no samples.
+    size_t fields = 1;
+    for (const char c : string_view(kSummaryColumns)) {
+        if (c == ',') ++fields;
+    }
+    for (size_t i = 0; i < fields; ++i) {
+        if (i > 0) {
+            out << ',';
+        }
+        // percentiles_bounded, the third column, is 1: there were no samples
+        // above 60s because there were no samples at all.
+        out << (i == 2 ? '1' : '0');
+    }
+    out << '\n';
 }
 
 void write_histogram(ostream& out, const Histogram& histogram) {
