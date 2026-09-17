@@ -12,10 +12,18 @@
 //     dariyanaap-null                       127.0.0.1, kernel-chosen port
 //     dariyanaap-null --port 9000           a fixed port
 //     dariyanaap-null --payload 256
+//     dariyanaap-null --stall-every 1000 --stall-for 200
+//
+// The stall knobs exist for E3. A target that freezes periodically is what
+// separates closed-loop from open-loop measurement, and E3 needs one before
+// M4's fault library exists. M4 generalises this into something other
+// people's services can link; this is the version that only has to stall
+// itself.
 //
 // The bound address is printed on the first line of stdout and flushed, so a
 // sweep script can read the port back when it asked for an ephemeral one.
 
+#include <atomic>
 #include <cstdio>
 #include <string>
 #include <thread>
@@ -36,6 +44,24 @@ namespace {
 // A connection ending is not an error here. A load generator hangs up on every
 // connection at the end of every run, so treating that as a failure would make
 // the target noisy exactly when it is working.
+// Set by the stall thread. Read once per request by every connection, which
+// is one relaxed load against a syscall pair — the same argument DESIGN.md
+// decision 9 makes for the fault library at M4.
+atomic<bool> g_stalled{false};
+
+// Freeze every connection for `duration`, every `period`. One thread flips a
+// flag rather than each connection sleeping on its own schedule, so all
+// connections stall together — which is what a real service does when it
+// blocks on a lock, a GC pause, or a slow dependency.
+void stall_periodically(Millis period, Millis duration) {
+    for (;;) {
+        this_thread::sleep_for(period);
+        g_stalled.store(true, memory_order_relaxed);
+        this_thread::sleep_for(duration);
+        g_stalled.store(false, memory_order_relaxed);
+    }
+}
+
 void serve(Socket client, size_t payload) {
     vector<char> buffer(payload > 64 * 1024 ? payload : 64 * 1024);
     try {
@@ -49,6 +75,13 @@ void serve(Socket client, size_t payload) {
                 }
                 have += got;
             }
+            while (g_stalled.load(memory_order_relaxed)) {
+                // Hold the reply. Not a sleep of fixed length: the connection
+                // resumes the moment the stall ends, so a 200ms stall delays a
+                // request by however much of it remained when the request
+                // arrived — which is what a real freeze does.
+                this_thread::sleep_for(Millis(1));
+            }
             client.write_all({buffer.data(), payload});
         }
     } catch (const IoError&) {
@@ -60,7 +93,9 @@ void serve(Socket client, size_t payload) {
 
 int main(int argc, char** argv) {
     try {
-        const Flags flags = Flags::parse(argc, argv, {"host", "port", "payload", "backlog"});
+        const Flags flags = Flags::parse(
+            argc, argv,
+            {"host", "port", "payload", "backlog", "stall-every", "stall-for"});
         const string host = flags.text("host", "127.0.0.1");
         const uint64_t port = flags.number("port", 0);
         const uint64_t payload = flags.number("payload", 64);
@@ -84,9 +119,24 @@ int main(int argc, char** argv) {
                                  static_cast<int>(backlog));
 
         // First line, flushed: a sweep script reads the port from here.
-        printf("listening %s payload %llu backlog %llu\n", listener.address().str().c_str(),
+        const uint64_t stall_every = flags.number("stall-every", 0);
+        const uint64_t stall_for = flags.number("stall-for", 0);
+        if ((stall_every == 0) != (stall_for == 0)) {
+            throw UsageError("--stall-every and --stall-for must be given together");
+        }
+        thread staller;
+        if (stall_every > 0) {
+            staller = thread(stall_periodically, Millis(static_cast<int64_t>(stall_every)),
+                             Millis(static_cast<int64_t>(stall_for)));
+            staller.detach();
+        }
+
+        printf("listening %s payload %llu backlog %llu stall %llu/%llu ms\n",
+               listener.address().str().c_str(),
                static_cast<unsigned long long>(payload),
-               static_cast<unsigned long long>(backlog));
+               static_cast<unsigned long long>(backlog),
+               static_cast<unsigned long long>(stall_for),
+               static_cast<unsigned long long>(stall_every));
         fflush(stdout);
 
         // Thread per connection, matching the rig's own naive model at M2. It

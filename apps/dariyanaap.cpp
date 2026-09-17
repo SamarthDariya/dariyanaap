@@ -18,6 +18,7 @@
 #include "core/version.hpp"
 #include "load/closed_loop.hpp"
 #include "load/http11_get.hpp"
+#include "load/open_loop.hpp"
 #include "load/raw_echo.hpp"
 #include "stats/csv.hpp"
 
@@ -28,6 +29,7 @@ namespace {
 
 constexpr const char* kUsage =
     "usage: dariyanaap --target HOST:PORT [options]\n"
+    "  --rate RPS          open-loop at this offered rate; omit for closed-loop\n"
     "  --connections N     connections held open (default 1)\n"
     "  --duration MS       measured window in ms (default 10000)\n"
     "  --warmup MS         discarded window before it (default 0)\n"
@@ -42,24 +44,27 @@ double as_ms(Nanos value) {
     return static_cast<double>(value.count()) / 1e6;
 }
 
-void report(const ClosedLoopRun& run, const ClosedLoopPlan& plan) {
-    printf("%s  target %s  %zu/%zu connections  %llu opens\n", version().data(),
-           plan.target.str().c_str(), run.connections_started,
-           run.connections_requested,
-           static_cast<unsigned long long>(run.connections_opened));
+// Takes the pieces rather than a mode-specific struct, so the two modes cannot
+// drift into reporting different things — which would make the one comparison
+// this repo exists for (E3) a comparison of two report formats.
+void report(const RunResult& result, const ClosedLoopPlan& plan, const char* mode,
+            size_t requested, size_t started, uint64_t opened, Nanos resolution) {
+    printf("%s  %s  target %s  %zu/%zu connections  %llu opens\n", version().data(), mode,
+           plan.target.str().c_str(), started, requested,
+           static_cast<unsigned long long>(opened));
 
-    if (run.connections_started < run.connections_requested) {
+    if (started < requested) {
         // The rig hit a limit, not the target. Said loudly, because comparing
         // this run's throughput against one that got all its threads is
         // comparing two different experiments.
         printf("  WARNING: only %zu of %zu connections started — the RIG is the limit here\n",
-               run.connections_started, run.connections_requested);
+               started, requested);
     }
 
-    const ErrorCounts& errors = run.result.errors;
+    const ErrorCounts& errors = result.errors;
     printf("  attempted %llu  errors: connect %llu write %llu read %llu "
            "timeout %llu protocol %llu rejected %llu\n",
-           static_cast<unsigned long long>(run.result.attempted),
+           static_cast<unsigned long long>(result.attempted),
            static_cast<unsigned long long>(errors.connect),
            static_cast<unsigned long long>(errors.write),
            static_cast<unsigned long long>(errors.read),
@@ -67,32 +72,33 @@ void report(const ClosedLoopRun& run, const ClosedLoopPlan& plan) {
            static_cast<unsigned long long>(errors.protocol),
            static_cast<unsigned long long>(errors.rejected));
 
-    if (!run.result.consistent()) {
+    if (!result.consistent()) {
         // Requests that went nowhere. Reported rather than hidden: a rig that
         // loses requests silently reports a throughput it never achieved.
         printf("  WARNING: accounting does not balance — %llu attempted, "
                "%llu timed, %llu untimed\n",
-               static_cast<unsigned long long>(run.result.attempted),
-               static_cast<unsigned long long>(run.result.timed()),
-               static_cast<unsigned long long>(run.result.untimed()));
+               static_cast<unsigned long long>(result.attempted),
+               static_cast<unsigned long long>(result.timed()),
+               static_cast<unsigned long long>(result.untimed()));
     }
 
-    if (!run.result.latency.has_value()) {
+    if (!result.latency.has_value()) {
         printf("  no latency distribution: nothing produced a duration\n");
         return;
     }
-    const Summary& s = *run.result.latency;
+    const Summary& s = *result.latency;
     printf("  %.0f req/s   p50 %.3fms  p90 %.3fms  p99 %.3fms  p999 %.3fms  max %.3fms\n",
            s.per_second(), as_ms(s.p50), as_ms(s.p90), as_ms(s.p99), as_ms(s.p999),
            as_ms(s.max));
     printf("  rig floor: clock resolution %lld ns%s\n",
-           static_cast<long long>(run.clock_resolution.count()),
+           static_cast<long long>(resolution.count()),
            s.percentiles_bounded() ? "" : "   (percentiles UNBOUNDED: samples past 60s)");
     // No mean, anywhere. DESIGN.md decision 3.
 }
 
-void write_csv(const string& directory, const ClosedLoopRun& run,
-               const ClosedLoopPlan& plan, const Flags& flags) {
+void write_csv(const string& directory, const RunResult& result, const Histogram& histogram,
+               const ClosedLoopPlan& plan, const Flags& flags, const char* mode,
+               size_t started, uint64_t opened, Nanos resolution) {
     const string summary_path = directory + "/summary.csv";
 
     // Append, and write the header only for a new file, so a sweep's six steps
@@ -103,16 +109,17 @@ void write_csv(const string& directory, const ClosedLoopRun& run,
         throw IoError("cannot write " + summary_path);
     }
     if (fresh) {
-        summary << "target,protocol,connections_requested,connections_started,"
+        summary << "target,protocol,mode,connections_requested,connections_started,"
                    "connections_opened,clock_resolution_ns,";
         csv::write_summary_header(summary);
     }
     summary << csv::quoted(plan.target.str()) << ','
             << csv::quoted(flags.text("protocol", "raw")) << ','
-            << plan.connections << ',' << run.connections_started << ','
-            << run.connections_opened << ',' << run.clock_resolution.count() << ',';
-    if (run.result.latency.has_value()) {
-        csv::write_summary_row(summary, *run.result.latency);
+            << csv::quoted(mode) << ','
+            << plan.connections << ',' << started << ','
+            << opened << ',' << resolution.count() << ',';
+    if (result.latency.has_value()) {
+        csv::write_summary_row(summary, *result.latency);
     } else {
         // A run with no distribution still gets a row: its error counts are
         // the result. Omitting it would leave a gap in a sweep that looks like
@@ -124,11 +131,11 @@ void write_csv(const string& directory, const ClosedLoopRun& run,
     // rebuilt from a summary, and they are what lets a run be re-percentiled
     // later (decision 4).
     const string histogram_path = directory + "/histogram.csv";
-    ofstream histogram(histogram_path);
-    if (!histogram) {
+    ofstream histogram_file(histogram_path);
+    if (!histogram_file) {
         throw IoError("cannot write " + histogram_path);
     }
-    csv::write_histogram(histogram, run.histogram);
+    csv::write_histogram(histogram_file, histogram);
     printf("  wrote %s and %s\n", summary_path.c_str(), histogram_path.c_str());
 }
 
@@ -139,7 +146,7 @@ int main(int argc, char** argv) {
         const Flags flags = Flags::parse(
             argc, argv,
             {"target", "connections", "duration", "warmup", "protocol", "payload", "path",
-             "read-timeout", "connect-timeout", "csv-dir"});
+             "read-timeout", "connect-timeout", "csv-dir", "rate"});
 
         if (!flags.has("target")) {
             fputs(kUsage, stderr);
@@ -173,12 +180,50 @@ int main(int argc, char** argv) {
             throw UsageError("--protocol must be raw or http, got \"" + protocol_name + "\"");
         }
 
-        const ClosedLoopRun run = run_closed_loop(*protocol, plan);
-        report(run, plan);
-        if (flags.has("csv-dir")) {
-            write_csv(flags.text("csv-dir", "."), run, plan, flags);
+        if (!flags.has("rate")) {
+            const ClosedLoopRun run = run_closed_loop(*protocol, plan);
+            report(run.result, plan, "closed-loop", run.connections_requested,
+                   run.connections_started, run.connections_opened, run.clock_resolution);
+            if (flags.has("csv-dir")) {
+                write_csv(flags.text("csv-dir", "."), run.result, run.histogram, plan,
+                          flags, "closed-loop", run.connections_started,
+                          run.connections_opened, run.clock_resolution);
+            }
+            return run.result.consistent() ? 0 : 1;
         }
-        return run.result.consistent() ? 0 : 1;
+
+        OpenLoopPlan open;
+        open.target = plan.target;
+        open.rate = Rate::per_second(flags.real("rate", 1000.0));
+        open.connections = plan.connections;
+        open.duration = plan.duration;
+        open.warmup = plan.warmup;
+        open.worker = plan.worker;
+
+        const OpenLoopRun run = run_open_loop(*protocol, open);
+        report(run.result, plan, "open-loop", run.connections_requested,
+               run.connections_started, run.connections_opened, run.clock_resolution);
+        printf("  schedule: %llu of %llu slots claimed%s",
+               static_cast<unsigned long long>(run.slots_claimed),
+               static_cast<unsigned long long>(run.slots_due),
+               run.kept_up() ? "\n" : "");
+        if (!run.kept_up()) {
+            // Decision 7's second self-check. The offered load was not what
+            // was configured, so the numbers describe a rate nobody asked for.
+            printf("   —  WARNING: THE RIG COULD NOT KEEP UP; THIS RUN IS VOID\n");
+        }
+        if (run.schedule_lag.count() > 0) {
+            printf("  schedule lag: p50 %.3fms  p99 %.3fms  max %.3fms\n",
+                   as_ms(run.schedule_lag.percentile(50.0).value()),
+                   as_ms(run.schedule_lag.percentile(99.0).value()),
+                   as_ms(run.schedule_lag.max()));
+        }
+        if (flags.has("csv-dir")) {
+            write_csv(flags.text("csv-dir", "."), run.result, run.histogram, plan, flags,
+                      "open-loop", run.connections_started, run.connections_opened,
+                      run.clock_resolution);
+        }
+        return (run.result.consistent() && run.kept_up()) ? 0 : 1;
     } catch (const UsageError& e) {
         fprintf(stderr, "dariyanaap: %s\n", e.what());
         return 2;
