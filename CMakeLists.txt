@@ -135,7 +135,20 @@ target_link_libraries(dariyanaap_load PUBLIC dariyanaap_stats)
 target_compile_options(dariyanaap_load PRIVATE ${DARIYANAAP_WARNINGS})
 add_library(dariyanaap::load ALIAS dariyanaap_load)
 
-# M4 adds dariyanaap_fault.
+# ---------------------------------------------------------------------------
+# Library: fault
+# ---------------------------------------------------------------------------
+#
+# Linked INTO the service under test, not into the driver. Depends on core and
+# nothing else — never on stats, because it gets linked into other people's
+# services and a fault knob that drags a histogram along is a nuisance.
+
+add_library(dariyanaap_fault
+  src/fault/knobs.cpp
+)
+target_link_libraries(dariyanaap_fault PUBLIC dariyanaap_core)
+target_compile_options(dariyanaap_fault PRIVATE ${DARIYANAAP_WARNINGS})
+add_library(dariyanaap::fault ALIAS dariyanaap_fault)
 # Each gets its own block here, and the layering is enforced by the build:
 # if core ever includes from load, it will not link.
 
@@ -193,9 +206,9 @@ if(DARIYANAAP_BUILD_TESTS)
 
   enable_testing()
 
-  foreach(suite core_tests stats_tests load_tests)
+  foreach(suite core_tests stats_tests load_tests fault_tests)
     add_executable(${suite} tests/${suite}.cpp)
-    target_link_libraries(${suite} PRIVATE dariyanaap_load doctest::doctest)
+    target_link_libraries(${suite} PRIVATE dariyanaap_load dariyanaap_fault doctest::doctest)
     target_include_directories(${suite} PRIVATE tests)
     target_compile_options(${suite} PRIVATE ${DARIYANAAP_WARNINGS})
     add_test(NAME ${suite} COMMAND ${suite})
