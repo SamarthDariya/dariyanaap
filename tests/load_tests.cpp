@@ -18,6 +18,7 @@
 #include "load/http11_get.hpp"
 #include "load/raw_echo.hpp"
 #include "load/run_result.hpp"
+#include "load/schedule.hpp"
 #include "load/worker.hpp"
 
 using namespace dariyanaap;
@@ -1112,4 +1113,91 @@ TEST_CASE("merged results equal the sum of the workers that produced them") {
     CHECK(run.result.errors.total() == 0);
     CHECK(run.result.latency->p50 <= run.result.latency->p99);
     CHECK(run.result.latency->p99 <= run.result.latency->p999);
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 3.1 — Schedule
+// ---------------------------------------------------------------------------
+
+TEST_CASE("slots are handed out in order, one per request, starting at zero") {
+    const MonotonicClock::Instant start = MonotonicClock::now();
+    Schedule schedule(Rate::per_second(1000.0), start);
+
+    for (std::uint64_t expected = 0; expected < 5; ++expected) {
+        const Schedule::Slot slot = schedule.claim();
+        CHECK(slot.index == expected);
+        CHECK(slot.due == start + Micros(1000 * expected));
+    }
+    CHECK(schedule.claimed() == 5);
+}
+
+TEST_CASE("due times come from the rate, computed not accumulated") {
+    // 3 rps is the rate whose interval rounds short, so an accumulating
+    // schedule drifts a millisecond over three million requests (chunk 0.4).
+    const MonotonicClock::Instant start = MonotonicClock::now();
+    Schedule schedule(Rate::per_second(3.0), start);
+
+    const Schedule::Slot first = schedule.claim();
+    CHECK(first.due == start);
+    for (int i = 0; i < 2; ++i) {
+        (void)schedule.claim();
+    }
+    const Schedule::Slot fourth = schedule.claim();
+    CHECK(fourth.index == 3);
+    CHECK(fourth.due == start + Rate::per_second(3.0).due_at(3));
+}
+
+TEST_CASE("many threads claiming get every index exactly once") {
+    // If two threads could claim the same index the rig would send fewer
+    // requests than the rate demanded and report the configured rate anyway.
+    // If a thread could skip one, the schedule would run ahead of real time.
+    constexpr int kThreads = 8;
+    constexpr int kPer = 20'000;
+    Schedule schedule(Rate::per_second(100'000.0), MonotonicClock::now());
+
+    std::vector<std::vector<std::uint64_t>> claimed(kThreads);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        claimed[static_cast<std::size_t>(t)].reserve(kPer);
+        threads.emplace_back([&schedule, &claimed, t] {
+            for (int i = 0; i < kPer; ++i) {
+                claimed[static_cast<std::size_t>(t)].push_back(schedule.claim().index);
+            }
+        });
+    }
+    for (std::thread& t : threads) t.join();
+
+    std::vector<std::uint64_t> all;
+    all.reserve(static_cast<std::size_t>(kThreads) * kPer);
+    for (const std::vector<std::uint64_t>& per_thread : claimed) {
+        all.insert(all.end(), per_thread.begin(), per_thread.end());
+    }
+    std::sort(all.begin(), all.end());
+
+    CHECK(all.size() == static_cast<std::size_t>(kThreads) * kPer);
+    CHECK(schedule.claimed() == all.size());
+    bool contiguous = true;
+    for (std::size_t i = 0; i < all.size(); ++i) {
+        if (all[i] != i) { contiguous = false; break; }
+    }
+    CHECK(contiguous);   // no duplicates, no gaps
+}
+
+TEST_CASE("one schedule shared beats one per thread, which would multiply the rate") {
+    // N threads with their own schedules at rate R would offer N*R. The
+    // shared counter is the reason the configured rate is the offered rate.
+    const MonotonicClock::Instant start = MonotonicClock::now();
+    Schedule shared(Rate::per_second(1000.0), start);
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) {
+        threads.emplace_back([&shared] {
+            for (int i = 0; i < 250; ++i) (void)shared.claim();
+        });
+    }
+    for (std::thread& t : threads) t.join();
+
+    // 1000 claims at 1000 rps is one second of schedule, whoever claimed them.
+    CHECK(shared.claimed() == 1000);
+    CHECK(shared.claim().due == start + Secs(1));
 }
