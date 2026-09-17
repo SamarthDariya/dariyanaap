@@ -85,13 +85,55 @@ or dropped. **That is a rig artifact, not a target failure**, and counting it as
 the very number this experiment exists to establish. Either ramp connections gradually, or raise the
 limit with `sudo sysctl -w kern.ipc.somaxconn=2048` and say in the results which was done.
 
-- **Predicted:** max throughput ___ rps · p99 floor ___ µs · rig becomes the bottleneck at ___ conns
-- **Measured:**
-- **Wrong about:**
+- **Predicted:** *not recorded before the run,* same as E1 — a 4-connection smoke test during chunk
+  2.12 had already shown ~97k rps, so an honest prediction was no longer available. E3 gets
+  predicted first; it is the one that matters, and this is now twice.
+- **Measured:** `./scripts/e2-sweep.sh`, RawEcho 64 bytes each way, loopback, 3s measured after
+  500ms warm-up per step, one `dariyanaap-null` for the whole sweep.
 
-Also worth predicting first: at what connection count does the *rig's* p99 detach from its p50? The
-rig is a thread-per-connection program, and unit 1 is about to break a thread-per-request server on
-exactly that. Expect to see the same curve in the tool as in the thing it measures.
+  | conns | req/s | p50 µs | p99 µs | p999 µs | max µs | clock res ns |
+  |---|---|---|---|---|---|---|
+  | 1 | 43,866 | 21.4 | **51.7** | 87.0 | 177.3 | 41 |
+  | 2 | 72,569 | 25.6 | 63.0 | 95.7 | 1,519.6 | 51 |
+  | 4 | 95,487 | 40.7 | 73.7 | 102.9 | 239.7 | 56 |
+  | 8 | 118,267 | 62.2 | 128.5 | 203.8 | 1,453.8 | 47 |
+  | 16 | 131,424 | 116.2 | 184.3 | 224.3 | 499.7 | 42 |
+  | **32** | **132,834** | 229.4 | 350.2 | 397.3 | 498.3 | 61 |
+  | 64 | 127,229 | 460.8 | 876.5 | 2,162.7 | 4,461.9 | 47 |
+  | 128 | 112,269 | 1,065.0 | 1,884.2 | 2,244.6 | 2,697.9 | 58 |
+  | 256 | 112,103 | 2,146.3 | 3,293.2 | 17,301.5 | 32,619.3 | 43 |
+  | 500 | 107,441 | 4,554.8 | 6,029.3 | 6,488.1 | 6,714.5 | 47 |
+  | 1000 | 85,743 | 11,730.9 | 19,398.7 | 53,739.5 | 132,687.6 | 47 |
+
+  All 11 steps started every connection they asked for, including 1000, and every step's accounting
+  balanced with zero errors of any kind.
+
+- **Wrong about:** two things, and the second is the more interesting.
+
+  **The clock resolution does not rise with concurrency.** Chunk 2.10 measures it at the warm-up
+  boundary while the workers run, on the argument that the floor during a 500-connection run
+  genuinely includes scheduler contention, and predicted it would climb. It does not: 41–61ns across
+  the whole sweep, with no trend — 41ns at 1 connection and 47ns at 1000. The hardware tick dominates
+  and contention is invisible in it. The decision was harmless but the reasoning behind it was wrong.
+
+  **The rig's p99 does not "detach" from its p50 at all.** The prediction in this file was that a
+  thread-per-connection program would show the same p99-detaches-from-p50 curve unit 1 is about to
+  find in a thread-per-request server. The p99/p50 ratio instead stays between 1.3× and 2.5× at every
+  concurrency, with no trend. What happens past saturation is that p50 and p99 rise *together*,
+  because the latency is not a tail effect — it is queueing, and queueing delays every request
+  equally.
+
+  That is Little's law, and it holds almost exactly:
+
+  | conns | concurrency ÷ throughput | measured p50 |
+  |---|---|---|
+  | 32 | 241 µs | 229 µs |
+  | 500 | 4,654 µs | 4,555 µs |
+  | 1000 | 11,663 µs | 11,731 µs |
+
+  So past 32 connections the rig is not degrading, it is *saturated*, and every extra connection
+  buys latency instead of throughput. Unit 1 will derive Little's law deliberately; it turned up here
+  uninvited, in the tool, on day one.
 
 **These three numbers get stamped into every CSV from here on.** Without them there is no way to tell
 a target's ceiling from the rig's.
@@ -144,9 +186,10 @@ Numbers established here that later units quote rather than re-derive:
 
 | Number | Value | Established in |
 |---|---|---|
-| Rig max throughput (null target) | | E2 |
-| Rig p99 floor | | E2 |
-| Rig bottleneck concurrency | | E2 |
+| Rig max throughput (null target) | **132,834 rps** at 32 connections, RawEcho 64B, loopback | E2 |
+| Rig p99 floor | **51.7 µs** at 1 connection (p50 21.4 µs) | E2 |
+| Rig bottleneck concurrency | **32 connections** — past it, throughput falls and latency is pure queueing | E2 |
+| Rig behaviour past saturation | Little's law, within 3%: p50 ≈ connections ÷ throughput | E2 |
 | Histogram p99 error bound | 0.4592% measured, 0.7812% structural | E1 |
 | Histogram p999 error bound | 0.5434% measured — the worst of any percentile | E1 |
 | `record()` cost | 2.3 ns/op warm (3.0 ns cold) | E1 |

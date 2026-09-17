@@ -53,14 +53,14 @@ Full reasoning, with the rejected alternatives, in **[DESIGN.md](DESIGN.md)**.
 
 ## Status
 
-**Design: drafted.** **Implementation: M0–M1 complete, M2 next.**
+**Design: drafted.** **Implementation: M0–M2 complete, M3 next.**
 
 | Milestone | What lands | Effort | Status |
 |---|---|---|---|
 | M0 — Skeleton | build, sanitizers, ctest, units, clock | 0.5d | ✅ |
 | M1 — Histogram | HDR buckets, percentiles, merge, CSV | 0.5d | ✅ |
-| M2 — Closed-loop driver | thread-per-conn, HTTP + raw TCP, **self-calibration** | 1d | 🔸 next |
-| M3 — Open-loop driver | `kqueue`, intended-send-time, **coordinated omission demo** | 1d | ⬜ |
+| M2 — Closed-loop driver | thread-per-conn, HTTP + raw TCP, **self-calibration** | 1d | ✅ |
+| M3 — Open-loop driver | intended-send-time, **coordinated omission demo** | 1d | 🔸 next |
 | M4 — Fault injection | the four primitives + a runtime control channel | 0.5d | ⬜ |
 | M5 — Output | CSV schema, plot script, submodule smoke test | 0.5d | ⬜ |
 
@@ -114,19 +114,22 @@ recording unit is nanoseconds, not microseconds (decision 7 needs a floor a µs 
 express), and "two significant digits" was a name rather than a parameter — the knob is sub-bucket
 count, and 128 is the only value meeting the ≤1% claim.
 
-### M2 — Closed-loop driver 🔸
-- [ ] `Protocol` interface: build a request, decide when a response is complete
-- [ ] `RawEcho` protocol (fixed-size ping/pong) and minimal HTTP/1.1 `GET` with `Content-Length`
-- [ ] thread-per-connection, blocking I/O, per-thread histogram
-- [ ] connect errors, read errors, timeouts and non-2xx counted **separately** — an error rate that
-      lumps them together hides which failure you caused
-- [ ] fixed-duration runs with a warm-up window excluded from the histogram
-- [ ] `dariyanaap-null` — an in-repo target that replies immediately, for calibrating the rig
-- [ ] **verifier:** against `dariyanaap-null`, the rig's own max throughput and p99 floor, and the
-      connection count at which the *rig* becomes the bottleneck. These three numbers go in
-      `BREAK.md` and get quoted in every later repo.
+### M2 — Closed-loop driver ✅
+- [x] `core::Socket` / `Listener` — RAII, non-blocking connect + `poll`, `SO_NOSIGPIPE`, `SO_REUSEADDR`
+- [x] `Protocol` interface: build a request, decide when a response is complete, say whether it passed
+- [x] `RawEcho` and minimal HTTP/1.1 `GET` framed by `Content-Length`, chunked refused by name
+- [x] thread-per-connection, blocking I/O, per-thread histogram merged once
+- [x] all six error kinds counted separately, with `consistent()` catching a request that vanished
+- [x] fixed-duration runs; warm-up excluded from **everything**, not just the histogram
+- [x] `dariyanaap-null` — RawEcho only, so E2 measures the rig rather than a server
+- [x] `dariyanaap` CLI + CSV with RFC 4180 quoting
+- [x] **E2 done:** **132,834 rps** peak at **32 connections**, p99 floor **51.7 µs**, and past
+      saturation the rig obeys Little's law within 3% — see `BREAK.md`
 
-### M3 — Open-loop driver ⬜
+The prediction fields for E1 and E2 are both empty, because both were run before being predicted.
+E3 is the one that matters and gets predicted first.
+
+### M3 — Open-loop driver 🔸
 - [ ] non-blocking sockets + `kqueue`, K event-loop threads owning C/K connections
 - [ ] a fixed-rate schedule: request *i* is due at `start + i/R`, and that is its start timestamp
 - [ ] latency measured from **intended** send time — the one line that kills coordinated omission
