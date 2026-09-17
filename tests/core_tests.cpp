@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <limits>
+#include <map>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -15,6 +16,7 @@
 #include "core/clock.hpp"
 #include "core/endpoint.hpp"
 #include "core/errors.hpp"
+#include "core/flags.hpp"
 #include "core/listener.hpp"
 #include "core/socket.hpp"
 #include "core/units.hpp"
@@ -595,16 +597,31 @@ TEST_CASE("many connects in sequence do not leak descriptors") {
 // Socket::connect_any
 // ---------------------------------------------------------------------------
 
-TEST_CASE("localhost connects to an IPv4-only target despite resolving IPv6 first") {
-    // The reason this chunk exists. On this machine:
-    //     localhost:80 -> [::1]:80 127.0.0.1:80
-    // and TestListener binds AF_INET only. A rig that tried addresses[0] and
-    // stopped would report a perfectly healthy target as refusing.
-    const TestListener listener;  // IPv4 only
+TEST_CASE("localhost connects to an IPv4-only target whatever order it resolves in") {
+    // The reason this chunk exists, and the order is NOT the stable part.
+    // This machine returned "[::1]:80 127.0.0.1:80" in one session and
+    // "127.0.0.1:80 [::1]:80" a week later, with no configuration change. So a
+    // rig that tried addresses[0] and stopped would work on Tuesday and report
+    // a perfectly healthy target as refusing on Wednesday — which is worse
+    // than failing every time.
+    //
+    // What is asserted is therefore the requirement, not the order: both
+    // families are offered, and connect_any reaches an IPv4-only listener
+    // regardless of which comes first.
+    const TestListener listener;  // AF_INET only
     const std::vector<SocketAddress> addrs =
         resolve(Endpoint("localhost", listener.port));
     REQUIRE(addrs.size() >= 2);
-    CHECK(addrs[0].family() == AF_INET6);  // the trap, confirmed present
+
+    bool has_v4 = false;
+    bool has_v6 = false;
+    for (const SocketAddress& a : addrs) {
+        has_v4 = has_v4 || a.family() == AF_INET;
+        has_v6 = has_v6 || a.family() == AF_INET6;
+    }
+    CHECK(has_v4);
+    CHECK(has_v6);  // the situation connect_any exists for is present
+    MESSAGE("localhost resolved first to " << addrs[0].str());
 
     const Socket s = Socket::connect_any(addrs, Millis(1000));
     CHECK(s.valid());
@@ -978,4 +995,83 @@ TEST_CASE("binding a port that needs privilege fails as an IoError") {
     } catch (const IoError& e) {
         CHECK(std::string(e.what()).find("127.0.0.1:1") != std::string::npos);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Flags
+// ---------------------------------------------------------------------------
+
+namespace {
+
+Flags parse_args(std::vector<const char*> args,
+                 std::vector<std::string> known = {"connections", "duration", "rate"}) {
+    std::vector<char*> argv;
+    argv.push_back(const_cast<char*>("dariyanaap"));
+    for (const char* a : args) argv.push_back(const_cast<char*>(a));
+    return Flags::parse(static_cast<int>(argv.size()), argv.data(), known);
+}
+
+}  // namespace
+
+TEST_CASE("flags are --name value pairs and nothing more") {
+    const Flags flags = parse_args({"--connections", "64", "--duration", "10"});
+    CHECK(flags.has("connections"));
+    CHECK(flags.number("connections", 1) == 64u);
+    CHECK(flags.number("duration", 1) == 10u);
+    CHECK_FALSE(flags.has("rate"));
+    CHECK(flags.number("rate", 7) == 7u);   // absent falls back
+}
+
+TEST_CASE("an unknown flag is refused, and the message lists what is accepted") {
+    // The usual cause is a near miss, so the fix belongs in the message. A run
+    // invoked with --connection would otherwise use the default silently and
+    // produce a sweep row that looks like the others and describes a different
+    // experiment.
+    try {
+        parse_args({"--connection", "64"});
+        FAIL("expected a throw");
+    } catch (const UsageError& e) {
+        const std::string what = e.what();
+        CHECK(what.find("--connection") != std::string::npos);
+        CHECK(what.find("--connections") != std::string::npos);
+        CHECK(what.find("--duration") != std::string::npos);
+    }
+}
+
+TEST_CASE("malformed invocations are refused rather than interpreted") {
+    CHECK_THROWS_AS(parse_args({"connections", "64"}), UsageError);   // no --
+    CHECK_THROWS_AS(parse_args({"--connections"}), UsageError);       // no value
+    CHECK_THROWS_AS(parse_args({"--"}), UsageError);                  // no name
+    CHECK_THROWS_AS(parse_args({"--connections", "64", "extra"}), UsageError);
+}
+
+TEST_CASE("a flag that is present and wrong never falls back to its default") {
+    // The failure mode this prevents: --connections=abc silently running at 1
+    // connection and reporting the throughput as though 64 were offered.
+    CHECK_THROWS_AS(parse_args({"--connections", "abc"}).number("connections", 1), UsageError);
+    CHECK_THROWS_AS(parse_args({"--connections", "64abc"}).number("connections", 1), UsageError);
+    CHECK_THROWS_AS(parse_args({"--connections", "+64"}).number("connections", 1), UsageError);
+    CHECK_THROWS_AS(parse_args({"--connections", ""}).number("connections", 1), UsageError);
+    CHECK_THROWS_AS(
+        parse_args({"--connections", "99999999999999999999999"}).number("connections", 1),
+        UsageError);
+}
+
+TEST_CASE("real numbers reject trailing junk, which stod would swallow") {
+    CHECK(parse_args({"--rate", "1500.5"}).real("rate", 0.0) == doctest::Approx(1500.5));
+    CHECK(parse_args({"--rate", "1e5"}).real("rate", 0.0) == doctest::Approx(100000.0));
+    // stod("1.5x") returns 1.5 and says nothing.
+    CHECK_THROWS_AS(parse_args({"--rate", "1.5x"}).real("rate", 0.0), UsageError);
+    CHECK_THROWS_AS(parse_args({"--rate", "nan"}).real("rate", 0.0), UsageError);
+    CHECK_THROWS_AS(parse_args({"--rate", "inf"}).real("rate", 0.0), UsageError);
+}
+
+TEST_CASE("every flag given is retrievable, for stamping into a CSV header") {
+    // A run has to be reproducible from its own output rather than from shell
+    // history, so the header carries what was actually passed.
+    const Flags flags = parse_args({"--duration", "30", "--connections", "500"});
+    const std::map<std::string, std::string>& all = flags.all();
+    CHECK(all.size() == 2);
+    CHECK(all.at("connections") == "500");
+    CHECK(all.at("duration") == "30");
 }

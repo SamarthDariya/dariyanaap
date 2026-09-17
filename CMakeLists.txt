@@ -91,6 +91,7 @@ add_library(dariyanaap_core
   src/core/socket.cpp
   src/core/address.cpp
   src/core/listener.cpp
+  src/core/flags.cpp
 )
 target_include_directories(dariyanaap_core PUBLIC src)
 target_compile_options(dariyanaap_core PRIVATE ${DARIYANAAP_WARNINGS})
