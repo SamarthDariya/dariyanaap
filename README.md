@@ -28,6 +28,12 @@ library the targets link, driven at runtime, not a proxy in front of them.
 
 ---
 
+**Where to look:** [Build](#build) · [**Using it**](#using-it) · [The numbers](#the-numbers) ·
+[Status](#status) · [Checkpoints](#checkpoints) — and [DESIGN.md](DESIGN.md) for why anything is the
+way it is, [BREAK.md](BREAK.md) for what got measured and what the predictions got wrong.
+
+---
+
 ## The thesis
 
 > **A load generator that lies is worse than no load generator.**
@@ -48,6 +54,290 @@ Rule 2 is the lesson of this unit — see [BREAK.md](BREAK.md). Learning it on d
 the next twelve sets of numbers worth collecting.
 
 Full reasoning, with the rejected alternatives, in **[DESIGN.md](DESIGN.md)**.
+
+---
+
+## Build
+
+```sh
+brew install cmake            # one-time
+
+cmake -B build
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+Or in one command, which is what the inner loop actually uses:
+
+```sh
+./scripts/check.sh          # build + test
+./scripts/check.sh --all    # also ASan/UBSan and TSan — the gate for "done"
+```
+
+It also enforces DESIGN.md decision 12 (`steady_clock` only) with a grep, so a
+`system_clock` creeping into `src/` fails the check rather than a review.
+
+With sanitizers by hand:
+
+```sh
+cmake -B build-tsan -DDARIYANAAP_TSAN=ON && cmake --build build-tsan -j
+cmake -B build-asan -DDARIYANAAP_ASAN=ON && cmake --build build-asan -j
+```
+
+Requires a C++20 compiler (developed against Apple Clang 17). doctest is fetched at configure time
+and is the only dependency.
+
+**Platform:** developed on macOS, so `kqueue` rather than `epoll`. The units that need cgroup memory
+limits or `tc`/`netem` run in Docker; this rig does not, because its faults are in-process by design.
+
+Vendoring it into another repo is under [Using it](#using-it).
+
+---
+
+## Using it
+
+Two halves, and the split is the thing to understand first:
+
+```
+   ┌─────────────────┐                        ┌────────────────────────┐
+   │   dariyanaap    │ ───── requests ──────► │   your service         │
+   │   the client    │                        │                        │
+   │                 │ ◄──── replies ──────── │   links                │
+   │   measures      │                        │   dariyanaap::fault    │
+   └─────────────────┘                        └────────────────────────┘
+          │                                              ▲
+     summary.csv                                  control socket
+   histogram.csv                              break it while it runs
+  timeseries.csv
+```
+
+The left half generates load and measures. The right half is a library your **target** links, so it
+can be made slow, made to drop replies, made to hang, or cut off from its peers. Decision 1 explains
+why that cannot be one program: unit 1's "DB call that sleeps 20ms" is a function inside the service,
+and unit 8 needs node A cut from node B while both stay reachable from the client. A proxy in front
+sees neither.
+
+### The client: three questions it can answer
+
+**"How fast can this go?"** — closed-loop. Omit `--rate` and each connection sends, waits for the
+reply, sends again.
+
+```sh
+./build/dariyanaap --target 127.0.0.1:9000 --connections 32 --duration 10000 --warmup 500
+```
+
+Good for peak throughput and for finding the concurrency where a service saturates.
+
+**"What is the p99 at 50,000 rps?"** — open-loop, and the only mode that can answer it.
+
+```sh
+./build/dariyanaap --target 127.0.0.1:9000 --connections 32 --rate 50000 \
+                   --duration 10000 --warmup 500
+```
+
+With `--rate`, request *i* is due at `start + i/rate` and goes out on schedule whether or not reply
+*i-1* has arrived — and latency is measured from when it was **due**, not when it was sent.
+Closed-loop cannot answer this question at all: its throughput is an output, not an input, so "the
+p99 at 50,000 rps" is not a thing you can ask it. E3 measured what the difference costs: against the
+same stalling target, closed-loop reported p99 = 0.41ms and open-loop 208ms. **504×.**
+
+**"What happens when it breaks?"** — the fault half, below.
+
+### Talking HTTP
+
+```sh
+./build/dariyanaap --target 127.0.0.1:8080 --protocol http --path /health \
+                   --connections 64 --rate 20000 --duration 10000
+```
+
+Minimal HTTP/1.1 `GET` framed by `Content-Length`. No TLS, no chunked encoding, no redirects — a
+chunked response is reported as a protocol error by name rather than mis-framed.
+
+### Getting numbers out
+
+```sh
+./build/dariyanaap ... --csv-dir runs/today --timeseries 1
+python3 tools/plot.py runs/today            # needs matplotlib
+```
+
+| File | Shape | Why |
+|---|---|---|
+| `summary.csv` | **appended**, one row per run | a concurrency sweep accumulates into one file that plots directly |
+| `histogram.csv` | one row per non-empty slot | raw counts, so a run can be re-percentiled months later without this binary |
+| `timeseries.csv` | one row per elapsed second | *when* it degraded, not just by how much. A second with no samples gets a row of zeros, because "the file has a gap" and "the service was down" are different findings |
+
+Values are nanoseconds. A microsecond column would record the rig's own 42ns floor as `0`.
+
+### Every flag
+
+```
+--target HOST:PORT     required. "[::1]:8080" for IPv6
+--rate RPS             open-loop at this offered rate; omit for closed-loop
+--connections N        connections held open (default 1)
+--duration MS          measured window (default 10000)
+--warmup MS            discarded window before it (default 0)
+--protocol raw|http    default raw
+--payload N            raw echo bytes each way (default 64)
+--path P               http path (default /)
+--read-timeout MS      also the write timeout (default 1000)
+--connect-timeout MS   default 1000
+--csv-dir DIR          write the three files here
+--timeseries 1         bucket by wall-clock second as well
+--help
+```
+
+A flag that is misspelled, or present with an unreadable value, is an error rather than a fallback to
+its default. `--connection 64` silently running at 1 connection would produce a sweep row that looks
+like all the others and describes a different experiment.
+
+### The target half: what your service calls
+
+```cpp
+#include "fault/knobs.hpp"
+using namespace dariyanaap;
+
+int main() {
+    fault::load_from_env();                            // knobs at startup
+    fault::set_identity("node-a");                     // only for partitions
+    fault::ControlServer control("127.0.0.1", 7777);   // knobs mid-run
+    // ... your accept loop
+}
+
+void handle_request(Connection& client) {
+    do_the_actual_work();
+
+    fault::before_response();             // applies latency; blocks while hung
+    if (fault::should_drop()) return;     // YOU decide what dropping means
+    client.send(reply);
+}
+
+void send_to_peer(const std::string& peer, const Message& message) {
+    if (fault::blocked(peer)) return;     // partition — unit 8
+    actually_send(peer, message);
+}
+```
+
+Those calls go in **unconditionally**, with no `#ifdef`. E4 measured the cost with every knob off:
+**+2.66 ns per request**, roughly one thousandth of the rig's own p99 floor. That is the whole point
+of decision 9 — if the checks were expensive you would guard them, the fault-injecting build would
+differ from the measured build, and your numbers would come from a different program than the one you
+are reasoning about.
+
+`should_drop()` deliberately does not act. Closing the connection and returning nothing look very
+different to a client, and which one you pick is part of the experiment.
+
+### Breaking things at startup
+
+```sh
+DARIYANAAP_FAULT_LATENCY_MS=20 DARIYANAAP_FAULT_JITTER_MS=5 ./my-service
+DARIYANAAP_FAULT_DROP=0.05 ./my-service
+DARIYANAAP_FAULT_IDENTITY=node-a DARIYANAAP_FAULT_PARTITION=node-a:node-b ./my-service
+```
+
+Jitter is not decoration: a fixed delay releases every affected request in lockstep, giving you a
+thundering herd you did not ask for and a histogram with one spike instead of a distribution.
+
+### Breaking things mid-run — the part that matters
+
+```sh
+$ nc 127.0.0.1 7777
+status
+no faults
+latency 200 20
+ok
+hang 1
+ok
+hang 0
+ok
+partition node-a node-b
+ok
+heal node-a node-b
+ok
+clear
+ok
+```
+
+This is what makes units 2, 8 and 9 possible at all (decision 10). "Kill a backend halfway through a
+run and watch it get slammed when it rejoins" is not expressible as startup configuration. A
+malformed command is answered with its error rather than closing the connection, so you can retype it
+instead of reconnecting.
+
+### Reading a run without fooling yourself
+
+```
+dariyanaap 0.1.0  closed-loop  target 127.0.0.1:57450  32/32 connections  32 opens
+  attempted 293867  errors: connect 0 write 0 read 0 timeout 0 protocol 0 rejected 0
+  97956 req/s   p50 0.242ms  p90 0.330ms  p99 0.459ms  p999 0.664ms  max 205.584ms
+  rig floor: clock resolution 57 ns
+```
+
+| What you see | What to do about it |
+|---|---|
+| `32/32 connections` | if the first number is smaller, **the rig hit a limit, not your target** — that row's throughput is not comparable to the others |
+| `32 opens` | more opens than connections means connections died and were replaced. Explain the churn before trusting the run |
+| six error counters | never one rate. "Refused connections" and "hung until we gave up" call for opposite responses, and unit 2 turns on exactly that difference |
+| `max` above `p999` | not a bug. `max` is exact; percentiles round **up** to a slot edge, so p999 can exceed max by up to 0.78% |
+| no mean | deliberate, and enforced by a `static_assert`. The mean averages "the fast path" and "the problem" and reports neither |
+| `THIS RUN IS VOID` | open-loop only. The rig could not offer the rate you asked for, so every other number describes a rate nobody requested. Lower the rate and rerun |
+
+**Know these two before trusting any measurement** (both from E2):
+
+- **Rig peak: 132,834 rps at 32 connections.** Past 32 the rig is saturated rather than degrading —
+  it obeys Little's law within 3%, so extra connections buy latency, not throughput. A target
+  measuring near 130k is measuring the rig.
+- **Rig p99 floor: 51.7 µs.** Nothing here can be measured as faster than that.
+
+### Vendoring it into the next repo
+
+```sh
+git submodule add https://github.com/SamarthDariya/dariyanaap.git vendor/dariyanaap
+```
+
+```cmake
+add_subdirectory(vendor/dariyanaap)
+target_link_libraries(my_service PRIVATE dariyanaap::fault)   # the target's half
+target_link_libraries(my_bench   PRIVATE dariyanaap::load)    # the driver's half
+```
+
+Tests, the CLI and doctest only build when `dariyanaap` is the top-level project, and `-Werror` is
+not forced on you. `./scripts/vendor-smoke-test.sh` asserts all four of those against a throwaway
+parent project rather than leaving them as claims.
+
+### The scripts
+
+```sh
+./scripts/check.sh              # build + test
+./scripts/check.sh --all        # also ASan/UBSan and TSan — run before committing
+./scripts/e2-sweep.sh           # the rig's own ceiling, 1 → 1000 connections
+./scripts/e3-omission.sh        # closed-loop vs open-loop against a stalling target
+./scripts/vendor-smoke-test.sh  # prove the submodule claims
+./build/hist_verify             # histogram accuracy, 1M samples
+./build/fault_cost              # cost of a disabled fault check
+```
+
+### One line to remember
+
+**Closed-loop answers "how fast?". Open-loop answers "how slow, at this rate?". Only the second
+question has an honest answer, and 504× is what the difference costs.**
+
+---
+
+## The numbers
+
+Everything later repos quote, in one place. Full working in [BREAK.md](BREAK.md).
+
+| | | |
+|---|---|---|
+| Rig peak throughput | **132,834 rps** at 32 connections | E2 |
+| Rig p99 floor | **51.7 µs** at 1 connection | E2 |
+| Rig bottleneck concurrency | **32 connections** | E2 |
+| Past saturation | Little's law within 3% | E2 |
+| **Coordinated omission** | **p99 504× worse open-loop than closed-loop, same target** | E3 |
+| Closed-loop capacity overstatement | **26%** | E3 |
+| Histogram error | 0.54% worst measured, 0.78% structural | E1 |
+| `record()` cost | 2.3 ns/op | E1 |
+| Disabled fault check | +2.66 ns per request | E4 |
+| Clock resolution | 42 ns warm, 90 ns cold | E0 |
 
 ---
 
@@ -171,74 +461,6 @@ E3 is the one that matters and gets predicted first.
 - [x] `scripts/vendor-smoke-test.sh` — builds a throwaway parent that links both halves and asserts
       no tests, no CLI, no doctest fetch, and **no `-Werror` forced on the parent**
 - [x] `BREAK.md` complete: E0–E4, with the two predictions that were wrong and why
-
----
-
-## The numbers
-
-Everything later repos quote, in one place. Full working in [BREAK.md](BREAK.md).
-
-| | | |
-|---|---|---|
-| Rig peak throughput | **132,834 rps** at 32 connections | E2 |
-| Rig p99 floor | **51.7 µs** at 1 connection | E2 |
-| Rig bottleneck concurrency | **32 connections** | E2 |
-| Past saturation | Little's law within 3% | E2 |
-| **Coordinated omission** | **p99 504× worse open-loop than closed-loop, same target** | E3 |
-| Closed-loop capacity overstatement | **26%** | E3 |
-| Histogram error | 0.54% worst measured, 0.78% structural | E1 |
-| `record()` cost | 2.3 ns/op | E1 |
-| Disabled fault check | +2.66 ns per request | E4 |
-| Clock resolution | 42 ns warm, 90 ns cold | E0 |
-
----
-
-## Build
-
-```sh
-brew install cmake            # one-time
-
-cmake -B build
-cmake --build build -j
-ctest --test-dir build --output-on-failure
-```
-
-Or in one command, which is what the inner loop actually uses:
-
-```sh
-./scripts/check.sh          # build + test
-./scripts/check.sh --all    # also ASan/UBSan and TSan — the gate for "done"
-```
-
-It also enforces DESIGN.md decision 12 (`steady_clock` only) with a grep, so a
-`system_clock` creeping into `src/` fails the check rather than a review.
-
-With sanitizers by hand:
-
-```sh
-cmake -B build-tsan -DDARIYANAAP_TSAN=ON && cmake --build build-tsan -j
-cmake -B build-asan -DDARIYANAAP_ASAN=ON && cmake --build build-asan -j
-```
-
-Requires a C++20 compiler (developed against Apple Clang 17). doctest is fetched at configure time
-and is the only dependency.
-
-**Platform:** developed on macOS, so `kqueue` rather than `epoll`. The units that need cgroup memory
-limits or `tc`/`netem` run in Docker; this rig does not, because its faults are in-process by design.
-
-### Using it from another repo
-
-```sh
-git submodule add https://github.com/SamarthDariya/dariyanaap.git vendor/dariyanaap
-```
-
-```cmake
-add_subdirectory(vendor/dariyanaap)
-target_link_libraries(my_service PRIVATE dariyanaap::fault)   # the target's half
-```
-
-Tests and the CLI only build when dariyanaap is the top-level project, so vendoring it adds two
-static libraries and nothing else.
 
 ---
 
