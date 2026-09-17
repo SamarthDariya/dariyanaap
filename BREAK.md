@@ -256,12 +256,37 @@ concept than any definition.
 `dariyanaap-null` in three builds: no `fault` linked · `fault` linked, all knobs off · `fault` linked,
 `drop_probability(0.0)` explicitly set.
 
-- **Predicted:** throughput delta ≤ ___% · p99 delta ≤ ___ µs
-- **Measured:**
-- **Wrong about:**
+- **Predicted (Claude, before running, after E3's lesson about reasoning with averages):**
+  under 5 ns per call. Two relaxed atomic loads plus two function calls that are not inlined across
+  the library boundary; a relaxed load on arm64 is a plain `ldr` from an almost-certainly-hot cache
+  line, so the calls should dominate.
 
-If this fails, decision 9 in `DESIGN.md` is wrong and targets will need `#ifdef` guards — which means
-the build being measured differs from the build being reasoned about, and that has to be fixed here
+- **Measured:** `./build/fault_cost 20000000`, after a warm-up pass.
+
+  | | ns/op | added |
+  |---|---|---|
+  | no fault calls at all | 0.153 | — |
+  | fault linked, every knob off | 2.809 | **+2.655** |
+  | `drop_probability(0.0)` set explicitly | 2.785 | +2.632 |
+
+  **+2.66 ns per request.** Against a syscall pair costing microseconds, that is roughly 0.03% of the
+  target's own per-request cost at the rig's own peak — and about one thousandth of the 51.7 µs p99
+  floor E2 measured. Decision 9 holds, and a target can call these unconditionally.
+
+  Setting `drop_probability(0.0)` explicitly costs the same as leaving it unset, which is the point
+  of the single gate: it is the *value* being zero that is cheap, not the knob being untouched.
+
+- **Wrong about:** nothing measurable, which is worth stating plainly rather than skipping. The
+  prediction was "under 5 ns" and the answer is 2.66 ns — the first prediction in this file that came
+  out right, and the first one made by reasoning about a mechanism (two loads, two un-inlined calls)
+  rather than about an average.
+
+  One thing the benchmark had to be written carefully to avoid: the `volatile` sink. Without it the
+  compiler is entitled to notice the loop has no observable effect and delete it, which would have
+  reported 0 ns/op and made decision 9 unfalsifiable instead of verified.
+
+If this had failed, decision 9 would be wrong and targets would need `#ifdef` guards — which means
+the build being measured differs from the build being reasoned about, and that had to be settled here
 rather than lived with for twelve repos.
 
 ---

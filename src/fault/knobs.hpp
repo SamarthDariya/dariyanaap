@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include <string_view>
 
 #include "core/units.hpp"
@@ -90,5 +91,37 @@ void clear();
 
 // Whether anything at all is enabled — the single bool every check reads.
 bool any_enabled();
+
+// ---------------------------------------------------------------------------
+// Getting the knobs set
+// ---------------------------------------------------------------------------
+
+// Read the environment once, at startup.
+//
+//   DARIYANAAP_FAULT_LATENCY_MS, DARIYANAAP_FAULT_JITTER_MS
+//   DARIYANAAP_FAULT_DROP            0.0 to 1.0
+//   DARIYANAAP_FAULT_HANG            1 to hang
+//   DARIYANAAP_FAULT_IDENTITY        this node's name
+//   DARIYANAAP_FAULT_PARTITION       "a:b", repeatable with commas
+//
+// Throws UsageError on a value it cannot read, rather than ignoring it. A
+// typo'd fault variable that silently does nothing produces a run that looks
+// like the experiment and is not it — which is the same failure the CLI's
+// unknown-flag check exists to prevent.
+void load_from_env();
+
+// Apply one instruction, in the form the control socket accepts. Exposed
+// separately so the grammar can be tested without a socket.
+//
+//   latency <mean_ms> <jitter_ms>
+//   drop <probability>
+//   hang <0|1>
+//   identity <name>
+//   partition <a> <b>
+//   heal <a> <b>
+//   clear
+//
+// Returns the reply to send back. Throws UsageError for anything else.
+std::string apply_command(std::string_view line);
 
 }  // namespace dariyanaap::fault

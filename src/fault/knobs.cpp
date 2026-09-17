@@ -1,11 +1,15 @@
 #include "fault/knobs.hpp"
 
 #include <atomic>
+#include <optional>
 #include <mutex>
 #include <random>
 #include <set>
 #include <thread>
+#include <cstdlib>
+#include <sstream>
 #include <utility>
+#include <vector>
 
 #include "core/errors.hpp"
 
@@ -182,6 +186,143 @@ void clear() {
         g_any_partition.store(false, memory_order_relaxed);
     }
     refresh_gate();
+}
+
+namespace {
+
+// Read one variable, or nothing. A variable that is set but unreadable is an
+// error rather than a default: see load_from_env's comment.
+optional<string> from_env(const char* name) {
+    const char* value = getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return nullopt;
+    }
+    return string(value);
+}
+
+double as_probability(const string& text, const char* what) {
+    istringstream in(text);
+    double value = 0.0;
+    in >> value;
+    if (in.fail() || !in.eof()) {
+        throw UsageError(string(what) + " must be a number, got \"" + text + "\"");
+    }
+    return value;
+}
+
+int64_t as_millis(const string& text, const char* what) {
+    istringstream in(text);
+    long long value = 0;
+    in >> value;
+    if (in.fail() || !in.eof()) {
+        throw UsageError(string(what) + " must be a whole number of ms, got \"" + text + "\"");
+    }
+    return value;
+}
+
+vector<string> split_on(string_view text, char separator) {
+    vector<string> parts;
+    string current;
+    for (const char c : text) {
+        if (c == separator) {
+            if (!current.empty()) parts.push_back(current);
+            current.clear();
+        } else {
+            current += c;
+        }
+    }
+    if (!current.empty()) parts.push_back(current);
+    return parts;
+}
+
+}  // namespace
+
+void load_from_env() {
+    if (const optional<string> name = from_env("DARIYANAAP_FAULT_IDENTITY")) {
+        set_identity(*name);
+    }
+
+    const optional<string> latency = from_env("DARIYANAAP_FAULT_LATENCY_MS");
+    const optional<string> jitter = from_env("DARIYANAAP_FAULT_JITTER_MS");
+    if (latency || jitter) {
+        set_latency(Millis(latency ? as_millis(*latency, "DARIYANAAP_FAULT_LATENCY_MS") : 0),
+                    Millis(jitter ? as_millis(*jitter, "DARIYANAAP_FAULT_JITTER_MS") : 0));
+    }
+    if (const optional<string> drop = from_env("DARIYANAAP_FAULT_DROP")) {
+        set_drop_probability(as_probability(*drop, "DARIYANAAP_FAULT_DROP"));
+    }
+    if (const optional<string> hang = from_env("DARIYANAAP_FAULT_HANG")) {
+        set_hang_forever(*hang == "1" || *hang == "true");
+    }
+    if (const optional<string> cuts = from_env("DARIYANAAP_FAULT_PARTITION")) {
+        for (const string& cut : split_on(*cuts, ',')) {
+            const vector<string> pair_of = split_on(cut, ':');
+            if (pair_of.size() != 2) {
+                throw UsageError("DARIYANAAP_FAULT_PARTITION wants \"a:b\", got \"" + cut + "\"");
+            }
+            partition(pair_of[0], pair_of[1]);
+        }
+    }
+}
+
+string apply_command(string_view line) {
+    const vector<string> words = split_on(line, ' ');
+    if (words.empty()) {
+        throw UsageError("empty command");
+    }
+    const string& verb = words[0];
+
+    auto expect = [&words, &verb](size_t count) {
+        if (words.size() != count + 1) {
+            throw UsageError(verb + " takes " + to_string(count) + " argument(s)");
+        }
+    };
+
+    if (verb == "latency") {
+        expect(2);
+        set_latency(Millis(as_millis(words[1], "latency")),
+                    Millis(as_millis(words[2], "jitter")));
+        return "ok";
+    }
+    if (verb == "drop") {
+        expect(1);
+        set_drop_probability(as_probability(words[1], "drop"));
+        return "ok";
+    }
+    if (verb == "hang") {
+        expect(1);
+        set_hang_forever(words[1] == "1" || words[1] == "true");
+        return "ok";
+    }
+    if (verb == "identity") {
+        expect(1);
+        set_identity(words[1]);
+        return "ok";
+    }
+    if (verb == "partition") {
+        expect(2);
+        partition(words[1], words[2]);
+        return "ok";
+    }
+    if (verb == "heal") {
+        expect(2);
+        heal(words[1], words[2]);
+        return "ok";
+    }
+    if (verb == "clear") {
+        expect(0);
+        clear();
+        return "ok";
+    }
+    if (verb == "status") {
+        expect(0);
+        return any_enabled() ? "faults active" : "no faults";
+    }
+    // Listing the verbs, for the reason the CLI lists its flags: the usual
+    // cause is a near miss, and a command that silently did nothing would
+    // leave a run looking like the experiment without being it.
+    throw UsageError("unknown command \"" + verb +
+                     "\"; try latency, drop, hang, identity, partition, heal, clear, status");
 }
 
 }  // namespace dariyanaap::fault

@@ -145,6 +145,7 @@ add_library(dariyanaap::load ALIAS dariyanaap_load)
 
 add_library(dariyanaap_fault
   src/fault/knobs.cpp
+  src/fault/control.cpp
 )
 target_link_libraries(dariyanaap_fault PUBLIC dariyanaap_core)
 target_compile_options(dariyanaap_fault PRIVATE ${DARIYANAAP_WARNINGS})
@@ -170,6 +171,11 @@ if(DARIYANAAP_BUILD_CLI)
   add_executable(dariyanaap-null apps/dariyanaap_null.cpp)
   target_link_libraries(dariyanaap-null PRIVATE dariyanaap_core)
   target_compile_options(dariyanaap-null PRIVATE ${DARIYANAAP_WARNINGS})
+
+  # E4: the cost of a disabled fault check (DESIGN.md decision 9).
+  add_executable(fault_cost apps/fault_cost.cpp)
+  target_link_libraries(fault_cost PRIVATE dariyanaap_fault)
+  target_compile_options(fault_cost PRIVATE ${DARIYANAAP_WARNINGS})
 
   add_executable(dariyanaap apps/dariyanaap.cpp)
   target_link_libraries(dariyanaap PRIVATE dariyanaap_load)

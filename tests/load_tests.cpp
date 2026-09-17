@@ -1247,9 +1247,13 @@ TEST_CASE("a rate well inside the target's ability leaves almost no schedule lag
 
     CHECK(run.kept_up());
     REQUIRE(run.schedule_lag.count() > 0);
-    // Sleeping until a due time costs a scheduler wakeup, so lag is not zero —
-    // but it should be tens of microseconds, not milliseconds.
-    CHECK(run.schedule_lag.percentile(99.0).value() < Millis(5));
+    // Asserted against the schedule interval, not against an absolute
+    // millisecond figure. The first version of this checked p99 lag < 5ms and
+    // passed everywhere except TSan, where everything is an order of magnitude
+    // slower — so it was testing the sanitizer rather than the rig. And p50
+    // rather than p99, because one late wakeup is not falling behind;
+    // persistently trailing the schedule is.
+    CHECK(run.schedule_lag.percentile(50.0).value() < plan.rate.interval() * 10);
 }
 
 TEST_CASE("latency is measured from the due time, not from the send") {
