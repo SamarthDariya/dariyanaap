@@ -291,6 +291,26 @@ rather than lived with for twelve repos.
 
 ---
 
+## What this unit was wrong about
+
+Rule 4 says the prediction error shrinking across twelve repos *is* the HLD skill, so the errors are
+worth collecting in one place rather than left in five write-ups.
+
+| Experiment | Predicted | Measured | The mistake |
+|---|---|---|---|
+| E0 | not predicted | clock 90ns cold, 42ns warm | assumed the *first read* was the slow part; it is CPU frequency scaling, and no amount of discarding single reads fixes it |
+| E1 | not predicted | 0.54% worst error | ran before predicting |
+| E2 | not predicted | 132,834 rps, Little's law | ran before predicting. The file's own guess — that the rig's p99 would detach from its p50 — was wrong: past saturation both rise together, because queueing delays every request equally |
+| **E3** | **45× p99 ratio** | **504×** | **estimated open-loop's p99 by averaging the stalled requests. That is the mean of a bimodal distribution — the exact thing decision 3 forbids reporting — in the repo built to avoid it** |
+| E4 | under 5 ns | 2.66 ns | right, and the first prediction made by reasoning about a mechanism rather than an average |
+
+Three of the five were never predicted, which is its own finding: the discipline is harder to keep
+than the code is to write. The two that were predicted went wrong in opposite directions — E3 by
+reasoning with a mean, E4 by reasoning with a mechanism and getting it right — which is as clear a
+demonstration of decision 3 as the histogram itself.
+
+---
+
 ## Carried forward
 
 Numbers established here that later units quote rather than re-derive:

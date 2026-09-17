@@ -53,7 +53,7 @@ Full reasoning, with the rejected alternatives, in **[DESIGN.md](DESIGN.md)**.
 
 ## Status
 
-**Design: drafted.** **Implementation: M0–M4 complete, M5 next.**
+**Design: drafted. Implementation: complete — M0 through M5, E0 through E4.**
 
 | Milestone | What lands | Effort | Status |
 |---|---|---|---|
@@ -62,10 +62,13 @@ Full reasoning, with the rejected alternatives, in **[DESIGN.md](DESIGN.md)**.
 | M2 — Closed-loop driver | thread-per-conn, HTTP + raw TCP, **self-calibration** | 1d | ✅ |
 | M3 — Open-loop driver | intended-send-time, **coordinated omission demo** | 1d | ✅ |
 | M4 — Fault injection | the four primitives + a runtime control channel | 0.5d | ✅ |
-| M5 — Output | CSV schema, plot script, submodule smoke test | 0.5d | 🔸 next |
+| M5 — Output | CSV schema, plot script, submodule smoke test | 0.5d | ✅ |
 
-~4 days. The track's estimate is 2–3; if it needs to be 2, cut M4's control channel to environment
-variables read at startup and skip the per-second timeseries in M5.
+The track budgeted 2–3 days and this plan said 4. What it actually took was longer, and the honest
+reason is that the socket layer (M2's chunks 2.1–2.4) was four chunks of plumbing before anything
+measured anything, and three of the five milestones produced a correction to `DESIGN.md` rather than
+just code. Those corrections are in the design doc, marked *Amended*, with the measurement that
+forced each one.
 
 ---
 
@@ -157,52 +160,36 @@ E3 is the one that matters and gets predicted first.
       51.7 µs p99 floor. Decision 9 holds, so a target can call these unconditionally
 - [x] 4 suites green under ASan/UBSan and TSan, including six threads reading knobs while they change
 
-### M5 — Output and ergonomics 🔸
-- [ ] CSV schema: `summary.csv`, `histogram.csv`, optional `timeseries.csv` (per-second p99)
-- [ ] every file stamped with rig version, target, mode, offered rate, duration, and rig ceiling
-- [ ] `tools/plot.py` — throwaway matplotlib; latency CDF and per-second p99. Not a product.
-- [ ] `dariyanaap --help` that reads like the flags an actual run needs
-- [ ] a scratch parent repo that adds this as a submodule and links both halves, so the vendoring
-      claim in M0 is tested rather than believed
-- [ ] `BREAK.md` complete: predictions, measurements, and what was wrong
+### M5 — Output and ergonomics ✅
+- [x] CSV schema: `summary.csv` (appended, one row per run), `histogram.csv` (raw slot counts),
+      `timeseries.csv` (per-second p50/p90/p99/max)
+- [x] every row stamped with rig version, target, protocol, mode, connections asked for **and**
+      started, and the measured clock resolution
+- [x] `tools/plot.py` — throughput vs concurrency, the latency CDF built from raw slot counts, and
+      p99 per second. Throwaway, and it says so
+- [x] `dariyanaap --help` and `dariyanaap-null --help`
+- [x] `scripts/vendor-smoke-test.sh` — builds a throwaway parent that links both halves and asserts
+      no tests, no CLI, no doctest fetch, and **no `-Werror` forced on the parent**
+- [x] `BREAK.md` complete: E0–E4, with the two predictions that were wrong and why
 
 ---
 
-## How this gets built — the chunk map
+## The numbers
 
-Milestones are broken into chunks of 20–25 lines of code, each with its test and its reasoning,
-reviewed and committed one at a time. The reason is not caution: a 620-line milestone commit is
-unreviewable, and on this track the design decisions *are* the learning, so a chunk that lands
-without being argued over has failed even if it works. M0 was first written in one pass and
-reverted for exactly that.
+Everything later repos quote, in one place. Full working in [BREAK.md](BREAK.md).
 
-**M0 — 9 chunks, done.** errors · units.hpp · units.cpp · Rate tests · clock.hpp · clock.cpp +
-tests · endpoint.hpp · Endpoint the type · `parse()` + rejections.
-
-**M1 — 8 chunks, done.** bucket layout · layout tests · `Histogram` · `percentile()` · `merge()` ·
-`Summary` · CSV · verifier.
-
-**M2 — 13 chunks.** The first milestone with real I/O, so four chunks of socket plumbing land
-before anything measures anything.
-
-| Chunk | Lands | The decision in it |
+| | | |
 |---|---|---|
-| 2.1 | `core/Socket` — RAII fd, move-only | Move-only, not shared: two owners closing one fd is a use-after-close that reads as a network error |
-| 2.2 | `Socket::connect(Endpoint, timeout)` | **Non-blocking connect + `poll`.** Blocking connect cannot be timed out, and M4's `hang_forever()` is a target the rig has to survive rather than hang alongside |
-| 2.3 | `read_some` / `write_all`, `SO_RCVTIMEO` | A timeout is a **recorded** latency, not a dropped sample — dropping it is coordinated omission wearing another hat |
-| 2.4 | `core/Listener` — bind, listen, accept | Only the null target uses it, but it is `core` so `fault` can reach it at M4 |
-| 2.5 | `load/Protocol` + `RawEcho` | Two methods: build a request, decide whether a response is complete |
-| 2.6 | `Http11Get` — request bytes, status parse | No chunked encoding, no keep-alive negotiation, no TLS |
-| 2.7 | `Http11Get` — response completeness | `Content-Length` only, tested against canned bytes rather than a live server |
-| 2.8 | `ErrorCounts` (6 kinds) + `RunResult` | Where M1's `optional<Summary>` earns itself: a run with zero successes reports counts and no distribution |
-| 2.9 | One connection's request loop | Classifying each failure as one of the six kinds |
-| 2.10 | Thread pool, join, merge, warm-up | Warm-up excluded **by comparison, not by swapping histograms** — the clock is already read for latency, so `elapsed >= warmup` is free. `measured_resolution()` is called here, at the end of warm-up, per E0 |
-| 2.11 | `apps/dariyanaap_null.cpp` | Speaks `RawEcho` **only, not HTTP**: calibration has to minimise the *target's* work or E2 measures the server instead of the rig |
-| 2.12 | `apps/dariyanaap.cpp` — CLI, CSV out | First strings in the CSV, so escaping lands here — chunk 1.7 flagged it as owed |
-| 2.13 | **E2** — the concurrency sweep | 1 → 10 → 50 → 100 → 500 → 1000. Predict before running |
-
-Thirteen chunks against a 1-day budget is closer to 1.5–2 days, and 2.2 is over the line size on
-its own. Recorded rather than smoothed over.
+| Rig peak throughput | **132,834 rps** at 32 connections | E2 |
+| Rig p99 floor | **51.7 µs** at 1 connection | E2 |
+| Rig bottleneck concurrency | **32 connections** | E2 |
+| Past saturation | Little's law within 3% | E2 |
+| **Coordinated omission** | **p99 504× worse open-loop than closed-loop, same target** | E3 |
+| Closed-loop capacity overstatement | **26%** | E3 |
+| Histogram error | 0.54% worst measured, 0.78% structural | E1 |
+| `record()` cost | 2.3 ns/op | E1 |
+| Disabled fault check | +2.66 ns per request | E4 |
+| Clock resolution | 42 ns warm, 90 ns cold | E0 |
 
 ---
 
