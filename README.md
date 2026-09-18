@@ -278,7 +278,9 @@ dariyanaap 0.1.0  closed-loop  target 127.0.0.1:57450  32/32 connections  32 ope
 | six error counters | never one rate. "Refused connections" and "hung until we gave up" call for opposite responses, and unit 2 turns on exactly that difference |
 | `max` above `p999` | not a bug. `max` is exact; percentiles round **up** to a slot edge, so p999 can exceed max by up to 0.78% |
 | no mean | deliberate, and enforced by a `static_assert`. The mean averages "the fast path" and "the problem" and reports neither |
-| `THIS RUN IS VOID` | open-loop only. The rig could not offer the rate you asked for, so every other number describes a rate nobody requested. Lower the rate and rerun |
+| `THIS RUN IS VOID` | open-loop only, and it means **the rig** was saturated: workers sat idle waiting for slots and still sent late. Every other number describes a rate nobody requested. Lower the rate and rerun |
+| `NOTE: connections, not --rate, limited this run` | open-loop only, and **not** a void run. Each connection carries one request at a time, so `connections / service_time` caps what can be offered; past that, slots queue. The latencies are honest and contain the wait — but the rate delivered was below the rate configured. Raise `--connections`, or quote the achieved rate |
+| `schedule lag … of which` | the split that tells those two apart. `waiting for a connection` is the target holding your pool; `the rig itself` is the only half that can void a run |
 
 **Know these two before trusting any measurement** (both from E2):
 
@@ -343,7 +345,7 @@ Everything later repos quote, in one place. Full working in [BREAK.md](BREAK.md)
 
 ## Status
 
-**Design: drafted. Implementation: complete — M0 through M5, E0 through E4.**
+**Design: drafted. Implementation: complete — M0 through M6, E0 through E5.**
 
 | Milestone | What lands | Effort | Status |
 |---|---|---|---|
@@ -353,6 +355,7 @@ Everything later repos quote, in one place. Full working in [BREAK.md](BREAK.md)
 | M3 — Open-loop driver | intended-send-time, **coordinated omission demo** | 1d | ✅ |
 | M4 — Fault injection | the four primitives + a runtime control channel | 0.5d | ✅ |
 | M5 — Output | CSV schema, plot script, submodule smoke test | 0.5d | ✅ |
+| M6 — Lag attribution | splitting schedule lag by cause, after unit 1 found the rig blaming itself | 0.5d | ✅ |
 
 The track budgeted 2–3 days and this plan said 4. What it actually took was longer, and the honest
 reason is that the socket layer (M2's chunks 2.1–2.4) was four chunks of plumbing before anything
@@ -429,6 +432,8 @@ E3 is the one that matters and gets predicted first.
       thread count is not the binding constraint at any concurrency this track uses
 - [x] latency measured from **intended** send time — the two lines that kill coordinated omission
 - [x] schedule-lag metric, and the run declared **VOID** when the sender is persistently behind
+- [x] *(amended, see M6)* schedule lag **split by cause** — the rig's own, versus waiting for a
+      connection. Only the first can void a run
 - [x] `--rate` on the CLI; `--stall-every` / `--stall-for` on the null target
 - [x] **E3 done: p99 ratio 504×** — closed-loop 0.414ms, open-loop 208.667ms, same target, and
       closed-loop *also* overstates throughput by 26%. Prediction was wrong by 11×, by reasoning
@@ -461,6 +466,20 @@ E3 is the one that matters and gets predicted first.
 - [x] `scripts/vendor-smoke-test.sh` — builds a throwaway parent that links both halves and asserts
       no tests, no CLI, no doctest fetch, and **no `-Werror` forced on the parent**
 - [x] `BREAK.md` complete: E0–E4, with the two predictions that were wrong and why
+
+### M6 — Lag attribution ✅
+> Opened after the repo was closed, by unit 1 (`dariyaraah`) reading it before writing any code of
+> its own. Unit 1's whole subject is a target with a 20ms service time, which is precisely the case
+> the old verdict got wrong.
+
+- [x] schedule lag split into `connection_wait` (the pool was too small for this target) and
+      `rig_lag` (the sender was genuinely late), recorded as separate histograms because percentiles
+      do not subtract
+- [x] `kept_up()` judges `rig_lag` alone — a slow target no longer prints **VOID** and exits 1
+- [x] `connections_saturated()` and a CLI note that says which of the two happened
+- [x] `EchoTarget` gained a per-reply delay, so the misattribution has a regression test
+- [x] DESIGN.md decision 7 amended; the **open-loop overflow** open question settled
+- [x] **E5** recorded: found by reading, not by measuring
 
 ---
 

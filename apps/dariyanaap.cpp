@@ -232,16 +232,37 @@ int main(int argc, char** argv) {
             printf("   —  WARNING: THE RIG COULD NOT KEEP UP; THIS RUN IS VOID\n");
         }
         if (run.schedule_lag.count() > 0) {
+            // Total first, then the split, because the split is the finding and
+            // the total is what the total was before anyone knew to ask.
             printf("  schedule lag: p50 %.3fms  p99 %.3fms  max %.3fms\n",
                    as_ms(run.schedule_lag.percentile(50.0).value()),
                    as_ms(run.schedule_lag.percentile(99.0).value()),
                    as_ms(run.schedule_lag.max()));
+            printf("    of which:   waiting for a connection p50 %.3fms"
+                   "   |   the rig itself p50 %.3fms\n",
+                   as_ms(run.connection_wait.percentile(50.0).value()),
+                   as_ms(run.rig_lag.percentile(50.0).value()));
+        }
+        if (run.connections_saturated()) {
+            // Not a warning and not void. Every connection carries one request
+            // at a time, so `connections / service_time` is a hard ceiling on
+            // what can be offered, and past it the rate configured is not the
+            // rate delivered. The latencies are honest — the wait is in them.
+            printf("   —  NOTE: connections, not --rate, limited this run. %zu connections\n"
+                   "      against this target's service time could not offer %.0f rps;\n"
+                   "      %.0f rps was achieved. Raise --connections to offer the rate.\n",
+                   run.connections_started, run.rate.rps(),
+                   run.result.latency.has_value() ? run.result.latency->per_second() : 0.0);
         }
         if (flags.has("csv-dir")) {
             write_csv(flags.text("csv-dir", "."), run.result, run.histogram, plan, flags,
                       "open-loop", run.connections_started, run.connections_opened,
                       run.clock_resolution, {});
         }
+        // kept_up() is now a verdict on the rig alone, so a connection-starved
+        // run exits 0: it is a valid measurement of a target that is slower
+        // than the pool can cover, which is the ordinary case in unit 1 and
+        // needs to be scriptable in a sweep.
         return (run.result.consistent() && run.kept_up()) ? 0 : 1;
     } catch (const UsageError& e) {
         fprintf(stderr, "dariyanaap: %s\n", e.what());

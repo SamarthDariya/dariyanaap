@@ -764,9 +764,13 @@ namespace {
 // had done one request in 300ms.
 class EchoTarget {
 public:
-    explicit EchoTarget(std::size_t payload)
+    // `delay` is held before each reply, which makes this a one-request-at-a-
+    // time target of known service time — the shape of every real service, and
+    // of unit 1's in particular. Zero by default, so existing cases are
+    // unchanged.
+    explicit EchoTarget(std::size_t payload, Millis delay = Millis(0))
         : listener_(Listener::bind_ephemeral("127.0.0.1")) {
-        acceptor_ = std::thread([this, payload] {
+        acceptor_ = std::thread([this, payload, delay] {
             for (;;) {
                 std::optional<Socket> served;
                 try {
@@ -779,8 +783,8 @@ public:
                 }
                 served->set_timeouts(Millis(5000), Millis(5000));
                 connections_.emplace_back(
-                    [served = std::move(*served), payload]() mutable {
-                        serve(served, payload);
+                    [served = std::move(*served), payload, delay]() mutable {
+                        serve(served, payload, delay);
                     });
             }
         });
@@ -804,7 +808,7 @@ private:
     // Echo `payload` bytes at a time until the client goes away. Returns
     // rather than throwing, so one client hanging up does not take the target
     // down with it.
-    static void serve(Socket& served, std::size_t payload) {
+    static void serve(Socket& served, std::size_t payload, Millis delay) {
         std::vector<char> buffer(64 * 1024);
         try {
             for (;;) {
@@ -814,6 +818,9 @@ private:
                         std::span<char>(buffer.data(), buffer.size()));
                     if (got == 0) return;  // client closed; this connection is done
                     total += got;
+                }
+                if (delay.count() > 0) {
+                    std::this_thread::sleep_for(delay);
                 }
                 served.write_all(std::span<const char>(buffer.data(), payload));
             }
@@ -1254,6 +1261,11 @@ TEST_CASE("a rate well inside the target's ability leaves almost no schedule lag
     // rather than p99, because one late wakeup is not falling behind;
     // persistently trailing the schedule is.
     CHECK(run.schedule_lag.percentile(50.0).value() < plan.rate.interval() * 10);
+
+    // Well inside the target's ability means neither half of the lag is real:
+    // the rig kept up AND the pool was never the limit.
+    CHECK(run.kept_up());
+    CHECK_FALSE(run.connections_saturated());
 }
 
 TEST_CASE("latency is measured from the due time, not from the send") {
@@ -1272,12 +1284,67 @@ TEST_CASE("latency is measured from the due time, not from the send") {
     const OpenLoopRun run = run_open_loop(protocol, plan);
 
     REQUIRE(run.result.latency.has_value());
-    // The rig could not keep up, and says so rather than reporting the rate.
-    CHECK_FALSE(run.kept_up());
     CHECK(run.slots_due > run.slots_claimed);
     // Requests waited for the connection, and the wait is in the latency.
     CHECK(run.schedule_lag.percentile(50.0).value() > Micros(100));
     CHECK(run.result.latency->p50 >= run.schedule_lag.percentile(50.0).value());
+
+    // This case used to assert CHECK_FALSE(kept_up()) — "the rig could not
+    // keep up, and says so rather than reporting the rate". That was wrong,
+    // and it is the reason the split exists. Nothing here saturates the rig:
+    // it is one connection, doing one request at a time, against a target that
+    // can answer faster than it can ask. The lag is the pool being too small
+    // for the rate, which is a fact about the plan, not a failure of the
+    // sender.
+    CHECK(run.kept_up());
+    CHECK(run.connections_saturated());
+}
+
+TEST_CASE("a slow target is not the rig failing to keep up") {
+    // The misattribution, staged directly. The target holds each connection
+    // for 10ms, so four of them can carry 400 rps and not one request more —
+    // and 2,000 rps is asked for anyway. Every worker is mid-request when its
+    // next slot comes due, every slot is late, and the OLD kept_up() would
+    // have called the run void and exited 1.
+    //
+    // This is exactly unit 1's ramp: a 20ms service time and a rate past
+    // connections/0.02s. If this case ever goes back to failing, twelve repos'
+    // worth of open-loop runs get thrown away for a fault the rig did not have.
+    const RawEcho protocol(64);
+    EchoTarget target(64, Millis(10));
+
+    OpenLoopPlan plan;
+    plan.target = Endpoint("127.0.0.1", target.port());
+    plan.rate = Rate::per_second(2000.0);
+    plan.connections = 4;          // 4 / 10ms = 400 rps, five times short
+    plan.duration = Millis(500);
+    plan.worker.read_timeout = Millis(2000);
+
+    const OpenLoopRun run = run_open_loop(protocol, plan);
+
+    REQUIRE(run.result.latency.has_value());
+    REQUIRE(run.schedule_lag.count() > 0);
+
+    // The verdict: the rig was fine, the pool was not.
+    CHECK(run.kept_up());
+    CHECK(run.connections_saturated());
+
+    // And the reason, compared rather than asserted in absolute milliseconds —
+    // under TSan every absolute figure here is an order of magnitude out.
+    CHECK(run.connection_wait.percentile(50.0).value() >
+          run.rig_lag.percentile(50.0).value());
+    // Five times oversubscribed against a 10ms target: the queue grows for the
+    // whole run, so the median wait is milliseconds, not microseconds.
+    CHECK(run.connection_wait.percentile(50.0).value() > Millis(1));
+
+    // The wait is in the latency, where it belongs: nothing can come back
+    // faster than the target's own service time.
+    CHECK(run.result.latency->p50 >= Millis(10));
+
+    // Every request contributes to all three, so the split is a partition of
+    // the lag and not a sample of it.
+    CHECK(run.connection_wait.count() == run.schedule_lag.count());
+    CHECK(run.rig_lag.count() == run.schedule_lag.count());
 }
 
 TEST_CASE("open-loop against nothing reports connect errors and stays consistent") {

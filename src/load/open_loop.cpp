@@ -34,6 +34,8 @@ struct OpenLoopWorker {
     vector<char> received;
     Histogram histogram;
     Histogram lag;
+    Histogram connection_wait;
+    Histogram rig_lag;
     ErrorCounts errors;
     uint64_t attempted = 0;
     uint64_t connections_opened = 0;
@@ -66,6 +68,12 @@ struct OpenLoopWorker {
                 }
             }
 
+            // Read before claiming: the moment this worker became able to
+            // carry a slot. Everything earlier — the previous request, a
+            // reconnect — is time during which no slot could have been sent,
+            // and the split below turns on it.
+            const MonotonicClock::Instant free_at = MonotonicClock::now();
+
             const Schedule::Slot slot = schedule.claim();
             if (slot.due >= deadline) {
                 // The schedule has run past the end of the run. Claiming it was
@@ -83,7 +91,20 @@ struct OpenLoopWorker {
 
             if (measuring) {
                 ++attempted;
-                lag.record(max(Nanos(0), MonotonicClock::between(slot.due, sending)));
+                const Nanos late = max(Nanos(0), MonotonicClock::between(slot.due, sending));
+                lag.record(late);
+
+                // Split the lateness by cause, which is the whole of this
+                // repo's second correction to kept_up(). If the slot was
+                // already overdue when this worker came free, that part of the
+                // wait belongs to whatever was holding the connection —
+                // usually the target. Whatever is left over happened after the
+                // worker was free and able to send, so it is the rig's.
+                //
+                // The two sum to `late` by construction, sample for sample.
+                const Nanos waited = max(Nanos(0), MonotonicClock::between(slot.due, free_at));
+                connection_wait.record(waited);
+                rig_lag.record(late - waited);
 
                 // The one line that separates this file from worker.cpp: the
                 // latency starts at slot.due, not at `sending`.
@@ -160,6 +181,8 @@ OpenLoopRun run_open_loop(const Protocol& protocol, const OpenLoopPlan& plan) {
     for (const unique_ptr<OpenLoopWorker>& worker : workers) {
         run.histogram.merge(worker->histogram);
         run.schedule_lag.merge(worker->lag);
+        run.connection_wait.merge(worker->connection_wait);
+        run.rig_lag.merge(worker->rig_lag);
         run.result.errors.merge(worker->errors);
         run.result.attempted += worker->attempted;
         run.connections_opened += worker->connections_opened;
