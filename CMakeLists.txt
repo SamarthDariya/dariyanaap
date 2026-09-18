@@ -169,7 +169,10 @@ if(DARIYANAAP_BUILD_CLI)
   # The calibration target for E2. Replies as fast as a socket allows, so the
   # number E2 produces is the rig's ceiling rather than a server's.
   add_executable(dariyanaap-null apps/dariyanaap_null.cpp)
-  target_link_libraries(dariyanaap-null PRIVATE dariyanaap_core)
+  # fault rather than core since M6: a steady service time (E5) needs the knob
+  # library, and a periodic stall is not a service time. fault links core
+  # PUBLIC, so naming both here is what the duplicate-library warning was.
+  target_link_libraries(dariyanaap-null PRIVATE dariyanaap_fault)
   target_compile_options(dariyanaap-null PRIVATE ${DARIYANAAP_WARNINGS})
 
   # E4: the cost of a disabled fault check (DESIGN.md decision 9).

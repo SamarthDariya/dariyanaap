@@ -303,11 +303,83 @@ worth collecting in one place rather than left in five write-ups.
 | E2 | not predicted | 132,834 rps, Little's law | ran before predicting. The file's own guess — that the rig's p99 would detach from its p50 — was wrong: past saturation both rise together, because queueing delays every request equally |
 | **E3** | **45× p99 ratio** | **504×** | **estimated open-loop's p99 by averaging the stalled requests. That is the mean of a bimodal distribution — the exact thing decision 3 forbids reporting — in the repo built to avoid it** |
 | E4 | under 5 ns | 2.66 ns | right, and the first prediction made by reasoning about a mechanism rather than an average |
+| **E5** | **not predicted** | **985.661 ms of lag was the target's, 0.000 ms the rig's** | **never asked which of two causes the number had. `kept_up()` was argued over twice, both times about the threshold, never about the input** |
 
-Three of the five were never predicted, which is its own finding: the discipline is harder to keep
-than the code is to write. The two that were predicted went wrong in opposite directions — E3 by
-reasoning with a mean, E4 by reasoning with a mechanism and getting it right — which is as clear a
+Four of the six were never predicted, which is its own finding: the discipline is harder to keep than
+the code is to write. The two that were predicted went wrong in opposite directions — E3 by reasoning
+with a mean, E4 by reasoning with a mechanism and getting it right — which is as clear a
 demonstration of decision 3 as the histogram itself.
+
+E5 is a different kind of mistake from the other five, and the one most worth carrying forward: it
+was not a bad prediction, it was a **question never asked**. Nothing measured was wrong. The numbers
+had been right in every run since M3. What was wrong was the single word attached to them.
+
+---
+
+## E5 — The rig blaming itself for the target (M6)
+
+Found by **reading**, not by running: unit 1 (`dariyaraah`) read this repo before writing a line of
+its own, and its whole subject is a target with a 20ms service time.
+
+`exchange.cpp` is synchronous — one request in flight per connection, no pipelining. So a worker
+blocked in a 20ms request cannot claim its next slot on time, and the lag that produces is
+indistinguishable, in `schedule_lag`, from a rig too saturated to send. `kept_up()` judged the median
+of that total. A slow target therefore made the rig **blame itself**.
+
+Staged directly: `dariyanaap-null` with `DARIYANAAP_FAULT_LATENCY_MS=20`, 32 connections, 4,000 rps
+offered against a `32 / 20ms` = 1,600 rps ceiling. Same target, same plan, both binaries.
+
+- **Predicted:** *nothing.* This was not a planned experiment, same as E0 — the empty field is the
+  honest record. What was predicted, and wrongly, lives in the code: the comment on `kept_up()` said
+  "if the rig cannot keep up, the offered load was not what was configured and the run is void",
+  and a test asserted `CHECK_FALSE(run.kept_up())` on a run where the rig was perfectly healthy.
+
+- **Measured:**
+
+  | | pre-fix (`main`) | post-fix |
+  |---|---|---|
+  | verdict | **THIS RUN IS VOID** | valid |
+  | exit code | **1** | 0 |
+  | throughput | 1,308 rps | 1,345 rps |
+  | p50 | 1,023.410 ms | 1,010.827 ms |
+  | p99 | 2,013.266 ms | 1,996.489 ms |
+  | schedule lag p50 | 998.244 ms | 985.661 ms |
+  | — waiting for a connection | *not measured* | **985.661 ms** |
+  | — the rig itself | *not measured* | **0.000 ms** |
+
+  The latencies are the same run twice. **Nothing about the measurement was ever wrong** — the
+  histogram already contained the queueing, correctly, because open-loop times from the due time.
+  Only the verdict was wrong, and it was wrong by 985.661 ms to 0.000 ms: every last microsecond of
+  that lag was the target holding the pool, and none of it was the rig.
+
+- **Wrong about:** three things, in rising order of how much they cost.
+
+  **The threshold was fine; the input to it was not.** Two versions of `kept_up()` had already been
+  argued over — slot counts, then medians, then *which* median — and both arguments were about
+  sensitivity. Neither noticed that the quantity being thresholded had two causes summed into it. A
+  more carefully tuned threshold on `schedule_lag` would have been more precisely wrong.
+
+  **"The rig cannot keep up" was never the only way to fall behind.** DESIGN.md's *Open-loop
+  overflow* open question already described this exact situation — "when every connection is
+  mid-request and the schedule says send now" — and deferred it as a policy choice about whether to
+  queue or open connections. It was filed as a **policy** question, so nobody looked for the
+  **reporting** bug sitting underneath it. The queue was implemented correctly the whole time. It
+  just had no name, and an unnamed queue got attributed to whoever was holding the stopwatch.
+
+  **The blast radius, which is the real finding.** This is not a cosmetic label. A `connections /
+  service_time` ceiling is what unit 1 exists to find, unit 2 runs into with a slow backend, unit 3
+  hits with a cold cache, and unit 9 hits deliberately. Every one of those runs is open-loop, past
+  the knee, against a slow target — so every one of them would have printed VOID and exited 1, and a
+  sweep script would have stopped on the first interesting row. The rig was built on the thesis that
+  a load generator that lies is worse than none; it then spent five milestones lying about exactly
+  one thing, in the direction of blaming itself, and the only reason it was caught before unit 1's
+  first measurement is that unit 1 read the source first.
+
+> The sequel to E2. There, the rig's own ceiling was measured so a target's flatline could never be
+> mistaken for the rig's. Here, the same confusion turned out to exist in the other direction and one
+> layer up: the rig's ceiling was known, and it still credited itself with the target's queue.
+
+---
 
 ---
 
@@ -330,3 +402,4 @@ Numbers established here that later units quote rather than re-derive:
 | Closed-loop throughput overstatement | **26%** — reports 100,641 rps where 80,000 is sustainable | E3 |
 | Clock resolution (warm) | **42 ns** — one tick of the 24 MHz timebase | M0 |
 | Clock resolution (cold) | 90 ns — an artifact of CPU frequency scaling, not granularity | M0 |
+| Open-loop's real rate ceiling | **`connections / service_time`**, because a connection carries one request at a time. Offer more and the excess queues as `connection_wait`; it does **not** void the run | E5 |

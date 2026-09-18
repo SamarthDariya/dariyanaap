@@ -16,9 +16,22 @@
 //
 // The stall knobs exist for E3. A target that freezes periodically is what
 // separates closed-loop from open-loop measurement, and E3 needs one before
-// M4's fault library exists. M4 generalises this into something other
-// people's services can link; this is the version that only has to stall
-// itself.
+// M4's fault library exists.
+//
+// M4 generalised that into something other people's services can link, and at
+// M6 this target links it too:
+//
+//     DARIYANAAP_FAULT_LATENCY_MS=20 dariyanaap-null
+//
+// A steady service time is a different shape from a periodic freeze, and E5
+// needed one: a target that is *reliably* slow is what makes a connection pool
+// persistently too small, which is the case unit 1 is entirely about and the
+// one the old kept_up() got wrong. The stall knobs stay — E3's numbers were
+// measured with them and a freeze is not a service time.
+//
+// The fault calls are unconditional, with no #ifdef, which is the usage the
+// README documents and E4 measured the cost of. E2's calibration predates them
+// by one relaxed bool load per request.
 //
 // The bound address is printed on the first line of stdout and flushed, so a
 // sweep script can read the port back when it asked for an ephemeral one.
@@ -33,6 +46,7 @@
 #include "core/flags.hpp"
 #include "core/listener.hpp"
 #include "core/socket.hpp"
+#include "fault/knobs.hpp"
 
 using namespace dariyanaap;
 using namespace std;
@@ -82,6 +96,12 @@ void serve(Socket client, size_t payload) {
                 // arrived — which is what a real freeze does.
                 this_thread::sleep_for(Millis(1));
             }
+            // The target half of this repo, used on itself. Applies injected
+            // latency and blocks for as long as a hang is set.
+            fault::before_response();
+            if (fault::should_drop()) {
+                continue;  // read the next request and let this one time out
+            }
             client.write_all({buffer.data(), payload});
         }
     } catch (const IoError&) {
@@ -100,10 +120,19 @@ int main(int argc, char** argv) {
                   "  --payload N         bytes echoed each way (default 64)\n"
                   "  --backlog N         listen backlog; macOS clamps to somaxconn\n"
                   "  --stall-every MS    freeze every connection periodically\n"
-                  "  --stall-for MS      for this long (both or neither)\n",
+                  "  --stall-for MS      for this long (both or neither)\n"
+                  "\n"
+                  "also reads the fault library's environment, for a steady\n"
+                  "service time rather than a periodic freeze:\n"
+                  "  DARIYANAAP_FAULT_LATENCY_MS, DARIYANAAP_FAULT_JITTER_MS\n"
+                  "  DARIYANAAP_FAULT_DROP, DARIYANAAP_FAULT_HANG\n",
                   stdout);
             return 0;
         }
+        // Throws on a value it cannot read, rather than running a different
+        // experiment from the one that was asked for.
+        fault::load_from_env();
+
         const Flags flags = Flags::parse(
             argc, argv,
             {"host", "port", "payload", "backlog", "stall-every", "stall-for"});

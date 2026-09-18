@@ -167,9 +167,21 @@ Those three go into `BREAK.md` and are stamped into every CSV thereafter. Withou
 a target flatlines there is no way to tell whose ceiling was hit — and the wrong answer there
 invalidates a whole unit's conclusion.
 
-In open-loop mode there is a second self-check with teeth: **schedule lag**. If the sender is
-persistently behind its own plan, it is saturated and the run is void. The rig says so loudly rather
-than printing plausible numbers.
+In open-loop mode there is a second self-check with teeth: **schedule lag** — but only once it is
+split by cause. A request can go out late for two unrelated reasons, and they call for opposite
+responses:
+
+- **the rig's own lag.** The worker was idle, waiting for a slot that had not come due yet, and still
+  sent late. That is saturation: the offered load was not what was configured, and the run is void.
+  The rig says so loudly rather than printing plausible numbers.
+- **waiting for a connection.** Every connection was still mid-request when the slot came due,
+  because a connection carries one request at a time and the target holds it for as long as it takes.
+  The rig was never behind. The pool was too small for that rate against *this* target, the latencies
+  are honest and contain the wait, and the run stands.
+
+`kept_up()` judges the first and nothing else. Conflating them meant a slow target produced schedule
+lag identical in shape to a saturated rig, so the rig blamed itself — see `BREAK.md` E5. The second
+is reported as `connection_wait`, alongside `slots_claimed` falling short of `slots_due`.
 
 ### 8. Warm-up is excluded, and the exclusion is visible
 
@@ -324,9 +336,20 @@ Recorded rather than resolved, to be settled by the first unit that needs them:
   connection count down? Unit 9 (`dariyadhaal`) is about retry policy, and a rig with an opinionated
   retry policy of its own would contaminate it. Leaning: no reconnect by default, and count the lost
   connection.
-- **Open-loop overflow.** When every connection is mid-request and the schedule says send now: queue
-  the request (keeping its intended timestamp), or open a new connection? Queueing measures the
-  target; opening connections measures the target *plus* its accept path. Probably a flag, defaulting
-  to queue.
+- ~~**Open-loop overflow.**~~ **Settled by unit 1, before it had written a line of its own code.**
+  When every connection is mid-request and the schedule says send now, the request queues, keeping
+  its intended timestamp — which is what an unclaimed slot already was. Opening connections on demand
+  is rejected outright rather than deferred to a flag: it measures the target *plus* its accept path,
+  and it makes the offered concurrency a function of the target's speed, which is the one thing
+  open-loop exists to hold fixed. What was actually missing was not a policy but a **name**. The
+  queue is now reported as `connection_wait`, which is what stops "the pool was too small" reading as
+  "the rig was saturated".
+- **CSV columns for the lag split.** `connection_wait` and `rig_lag` are printed and nothing more;
+  `summary.csv` has never carried schedule lag in any form. A sweep that walks `--rate` across a
+  target's `connections / service_time` knee wants the split as two columns it can plot, not as text
+  to scrape out of a log. Deferred deliberately rather than done here: it touches `csv.hpp`, the
+  documented schema and `tools/plot.py`, and unit 1's M2 is the first run that will actually want it.
+  Whoever adds it adds a plot too, or it is a column nobody reads.
+
 - **Whether `fault::partition` needs peer identity.** Unit 8's three-node store must name its peers.
   Passing that identity in may be the one place this library needs to know something about its host.
